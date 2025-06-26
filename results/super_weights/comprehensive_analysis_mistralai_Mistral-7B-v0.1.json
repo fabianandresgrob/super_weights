@@ -1,0 +1,33 @@
+{
+  "model_name": "mistralai-Mistral-7B-v0.1",
+  "num_layers": 32,
+  "total_super_weights": 2,
+  "super_weights": [
+    {
+      "layer": 1,
+      "coordinates": [
+        2070,
+        7310
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 950.0,
+      "output_value": -262.75,
+      "iteration_found": 1,
+      "magnitude_product": 249612.5,
+      "original_value": -0.2734375
+    },
+    {
+      "layer": 31,
+      "coordinates": [
+        53,
+        2187
+      ],
+      "component": "mlp.down_proj",
+      "input_value": -907.0,
+      "output_value": -84.5625,
+      "iteration_found": 1,
+      "magnitude_product": 76698.1875,
+      "original_value": 0.0849609375
+    }
+  ]
+}

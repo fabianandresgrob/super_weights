@@ -1,0 +1,34 @@
+name: super-weights
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch::pytorch
+  - pytorch::torchvision
+  - pytorch::torchaudio
+  - numpy=1.26.4
+  - pandas
+  - matplotlib
+  - seaborn
+  - plotly
+  - jupyter
+  - notebook
+  - ipywidgets
+  - jupyterlab
+  - scikit-learn
+  - transformers
+  - datasets
+  - accelerate
+  - evaluate
+  - tokenizers
+  - huggingface_hub
+  - tqdm
+  - wandb
+  - ipykernel
+  - pip
+  - pip:
+      - einops
+      - graphviz
+      - captum
+      - torch-geometric 

@@ -1,0 +1,59 @@
+{
+  "model_name": "allenai-OLMo-1B-0724-hf",
+  "num_layers": 16,
+  "total_super_weights": 4,
+  "super_weights": [
+    {
+      "layer": 1,
+      "coordinates": [
+        1764,
+        1710
+      ],
+      "component": "mlp.down_proj",
+      "input_value": -401.5,
+      "output_value": -262.0,
+      "iteration_found": 1,
+      "magnitude_product": 105193.0,
+      "original_value": 0.63232421875
+    },
+    {
+      "layer": 15,
+      "coordinates": [
+        1764,
+        6840
+      ],
+      "component": "mlp.down_proj",
+      "input_value": -283.0,
+      "output_value": 415.0,
+      "iteration_found": 1,
+      "magnitude_product": 117445.0,
+      "original_value": -0.72607421875
+    },
+    {
+      "layer": 2,
+      "coordinates": [
+        1764,
+        8041
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 345.25,
+      "output_value": -227.5,
+      "iteration_found": 2,
+      "magnitude_product": 78544.375,
+      "original_value": -0.59228515625
+    },
+    {
+      "layer": 15,
+      "coordinates": [
+        1764,
+        3454
+      ],
+      "component": "mlp.down_proj",
+      "input_value": -170.375,
+      "output_value": 145.875,
+      "iteration_found": 2,
+      "magnitude_product": 24853.453125,
+      "original_value": -0.828125
+    }
+  ]
+}

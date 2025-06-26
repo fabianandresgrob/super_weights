@@ -1,0 +1,399 @@
+import torch
+import numpy as np
+from typing import List, Dict, Any, Optional
+from datasets import load_dataset
+
+from detection.super_weight import SuperWeight
+
+
+class MetricsAnalyzer:
+    """
+    Analyzes performance metrics (perplexity, accuracy) with super weight modifications.
+    """
+    
+    def __init__(self, model, tokenizer, manager):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.manager = manager
+        
+        # Add padding token if not present
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+    
+    def measure_perplexity_impact(self, super_weight: SuperWeight, 
+                                dataset_name: str = 'wikitext',
+                                dataset_config: str = 'wikitext-2-raw-v1',
+                                split: str = 'test',
+                                n_samples: int = 100,
+                                max_length: int = 512) -> Dict[str, Any]:
+        """
+        Measure perplexity impact of a super weight using causal intervention.
+        
+        Args:
+            super_weight: SuperWeight to analyze
+            dataset_name: HuggingFace dataset name
+            dataset_config: Dataset configuration
+            split: Dataset split to use
+            n_samples: Number of samples to evaluate
+            max_length: Maximum sequence length
+            
+        Returns:
+            Dictionary with perplexity metrics
+        """
+        
+        # Load dataset
+        dataset = load_dataset(dataset_name, dataset_config, split=split, streaming=True)
+        dataset = dataset.shuffle(seed=42)  # Shuffle for randomness
+        texts = []
+        
+        # Sample texts
+        for i, example in enumerate(dataset):
+            if i >= n_samples:
+                break
+            text = example['text'].strip()
+            if len(text) > 50:  # Skip very short texts
+                texts.append(text)
+        
+        if len(texts) < n_samples:
+            texts = texts * ((n_samples // len(texts)) + 1)
+            texts = texts[:n_samples]
+        
+        # Measure baseline perplexity
+        baseline_perplexity = self._compute_perplexity(texts, max_length)
+        
+        # Measure perplexity with super weight zeroed
+        with self.manager.temporary_zero([super_weight]):
+            modified_perplexity = self._compute_perplexity(texts, max_length)
+        
+        # Calculate impact metrics
+        perplexity_ratio = modified_perplexity / baseline_perplexity
+        perplexity_increase = modified_perplexity - baseline_perplexity
+        
+        return {
+            'super_weight': super_weight,
+            'baseline_perplexity': baseline_perplexity,
+            'modified_perplexity': modified_perplexity,
+            'perplexity_ratio': perplexity_ratio,
+            'perplexity_increase': perplexity_increase,
+            'impact_severity': self._classify_perplexity_impact(perplexity_ratio),
+            'dataset_info': {
+                'name': dataset_name,
+                'config': dataset_config,
+                'split': split,
+                'n_samples': len(texts)
+            }
+        }
+    
+    def _compute_perplexity(self, texts: List[str], max_length: int) -> float:
+        """Compute perplexity on a list of texts"""
+        total_loss = 0.0
+        total_tokens = 0
+        
+        for text in texts:
+            # Tokenize
+            encoding = self.tokenizer(
+                text,
+                max_length=max_length,
+                truncation=True,
+                padding=False,
+                return_tensors='pt'
+            )
+            
+            input_ids = encoding['input_ids'].to(self.model.device)
+            
+            # Skip very short sequences
+            if input_ids.shape[1] < 2:
+                continue
+            
+            with torch.no_grad():
+                outputs = self.model(input_ids, labels=input_ids)
+                loss = outputs.loss
+                
+                # Accumulate loss and token count
+                total_loss += loss.item() * input_ids.numel()
+                total_tokens += input_ids.numel()
+        
+        if total_tokens == 0:
+            return float('inf')
+        
+        avg_loss = total_loss / total_tokens
+        perplexity = torch.exp(torch.tensor(avg_loss)).item()
+        
+        return perplexity
+    
+    def _classify_perplexity_impact(self, perplexity_ratio: float) -> str:
+        """Classify the severity of perplexity impact"""
+        if perplexity_ratio > 10.0:
+            return "catastrophic"
+        elif perplexity_ratio > 3.0:
+            return "severe"
+        elif perplexity_ratio > 1.5:
+            return "moderate"
+        elif perplexity_ratio > 1.1:
+            return "mild"
+        else:
+            return "minimal"
+    
+    def measure_accuracy_impact(self, super_weight: SuperWeight,
+                              task: str = 'hellaswag',
+                              n_samples: int = 100) -> Dict[str, Any]:
+        """
+        Measure accuracy impact on downstream tasks.
+        
+        Args:
+            super_weight: SuperWeight to analyze
+            task: Task name (hellaswag, arc_easy, arc_challenge, etc.)
+            n_samples: Number of samples to evaluate
+            
+        Returns:
+            Dictionary with accuracy metrics
+        """
+        
+        # Load task data
+        task_data = self._load_task_data(task, n_samples)
+        
+        if not task_data:
+            return {
+                'error': f"Could not load task data for {task}",
+                'super_weight': super_weight
+            }
+        
+        # Measure baseline accuracy
+        baseline_accuracy = self._compute_accuracy(task_data, task)
+        
+        # Measure accuracy with super weight zeroed
+        with self.manager.temporary_zero([super_weight]):
+            modified_accuracy = self._compute_accuracy(task_data, task)
+        
+        # Calculate impact metrics
+        accuracy_drop = baseline_accuracy - modified_accuracy
+        accuracy_ratio = modified_accuracy / baseline_accuracy if baseline_accuracy > 0 else 0.0
+        
+        return {
+            'super_weight': super_weight,
+            'task': task,
+            'baseline_accuracy': baseline_accuracy,
+            'modified_accuracy': modified_accuracy,
+            'accuracy_drop': accuracy_drop,
+            'accuracy_ratio': accuracy_ratio,
+            'impact_severity': self._classify_accuracy_impact(accuracy_drop),
+            'n_samples': len(task_data)
+        }
+    
+    def _load_task_data(self, task: str, n_samples: int) -> Optional[List[Dict]]:
+        """Load data for a specific task"""
+        try:
+            if task == 'hellaswag':
+                dataset = load_dataset('hellaswag', split='validation', streaming=True)
+                dataset = dataset.shuffle(seed=42)  # Shuffle for randomness
+                data = []
+                for i, example in enumerate(dataset):
+                    if i >= n_samples:
+                        break
+                    data.append({
+                        'context': example['ctx'],
+                        'endings': example['endings'],
+                        'label': int(example['label'])
+                    })
+                return data
+            
+            elif task == 'arc_easy':
+                dataset = load_dataset('ai2_arc', 'ARC-Easy', split='test', streaming=True)
+                data = []
+                for i, example in enumerate(dataset):
+                    if i >= n_samples:
+                        break
+                    data.append({
+                        'question': example['question'],
+                        'choices': example['choices']['text'],
+                        'label': example['choices']['label'].index(example['answerKey'])
+                    })
+                return data
+            
+            elif task == 'arc_challenge':
+                dataset = load_dataset('ai2_arc', 'ARC-Challenge', split='test', streaming=True)
+                data = []
+                for i, example in enumerate(dataset):
+                    if i >= n_samples:
+                        break
+                    data.append({
+                        'question': example['question'],
+                        'choices': example['choices']['text'],
+                        'label': example['choices']['label'].index(example['answerKey'])
+                    })
+                return data
+            
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"Error loading task {task}: {e}")
+            return None
+    
+    def _compute_accuracy(self, task_data: List[Dict], task: str) -> float:
+        """Compute accuracy on task data"""
+        correct = 0
+        total = 0
+        
+        for example in task_data:
+            try:
+                if task == 'hellaswag':
+                    prediction = self._predict_hellaswag(example)
+                elif task in ['arc_easy', 'arc_challenge']:
+                    prediction = self._predict_arc(example)
+                else:
+                    continue
+                
+                if prediction == example['label']:
+                    correct += 1
+                total += 1
+                
+            except Exception as e:
+                # Skip examples that cause errors
+                continue
+        
+        return correct / total if total > 0 else 0.0
+    
+    def _predict_hellaswag(self, example: Dict) -> int:
+        """Predict HellaSwag completion"""
+        context = example['context']
+        endings = example['endings']
+        
+        best_score = float('-inf')
+        best_idx = 0
+        
+        for i, ending in enumerate(endings):
+            # Create full text
+            full_text = context + " " + ending
+            
+            # Tokenize
+            tokens = self.tokenizer(full_text, return_tensors='pt').to(self.model.device)
+            
+            # Compute log probability
+            with torch.no_grad():
+                outputs = self.model(**tokens, labels=tokens['input_ids'])
+                log_prob = -outputs.loss.item()
+                
+                if log_prob > best_score:
+                    best_score = log_prob
+                    best_idx = i
+        
+        return best_idx
+    
+    def _predict_arc(self, example: Dict) -> int:
+        """Predict ARC answer"""
+        question = example['question']
+        choices = example['choices']
+        
+        best_score = float('-inf')
+        best_idx = 0
+        
+        for i, choice in enumerate(choices):
+            # Create question-answer pair
+            qa_text = f"Question: {question}\nAnswer: {choice}"
+            
+            # Tokenize
+            tokens = self.tokenizer(qa_text, return_tensors='pt').to(self.model.device)
+            
+            # Compute log probability
+            with torch.no_grad():
+                outputs = self.model(**tokens, labels=tokens['input_ids'])
+                log_prob = -outputs.loss.item()
+                
+                if log_prob > best_score:
+                    best_score = log_prob
+                    best_idx = i
+        
+        return best_idx
+    
+    def _classify_accuracy_impact(self, accuracy_drop: float) -> str:
+        """Classify the severity of accuracy impact"""
+        if accuracy_drop > 0.5:
+            return "catastrophic"
+        elif accuracy_drop > 0.2:
+            return "severe"
+        elif accuracy_drop > 0.1:
+            return "moderate"
+        elif accuracy_drop > 0.05:
+            return "mild"
+        else:
+            return "minimal"
+    
+    def comprehensive_impact_analysis(self, super_weight: SuperWeight,
+                                    perplexity_config: Dict = None,
+                                    accuracy_tasks: List[str] = None) -> Dict[str, Any]:
+        """
+        Run analysis on multiple metrics.
+        
+        Args:
+            super_weight: SuperWeight to analyze
+            perplexity_config: Configuration for perplexity measurement
+            accuracy_tasks: List of tasks for accuracy measurement
+            
+        Returns:
+            Dictionary with results across all metrics
+        """
+        
+        if perplexity_config is None:
+            perplexity_config = {'n_samples': 50}
+        
+        if accuracy_tasks is None:
+            accuracy_tasks = ['hellaswag']
+        
+        results = {
+            'super_weight': super_weight,
+            'perplexity_analysis': self.measure_perplexity_impact(super_weight, **perplexity_config),
+            'accuracy_analyses': {}
+        }
+        
+        # Run accuracy analysis for each task
+        for task in accuracy_tasks:
+            try:
+                results['accuracy_analyses'][task] = self.measure_accuracy_impact(super_weight, task, n_samples=50)
+            except Exception as e:
+                results['accuracy_analyses'][task] = {'error': str(e)}
+        
+        # Compute overall impact score
+        results['overall_impact'] = self._compute_overall_impact_score(results)
+        
+        return results
+    
+    def _compute_overall_impact_score(self, results: Dict) -> Dict[str, Any]:
+        """Compute an overall impact score combining multiple metrics"""
+        
+        # Perplexity impact score (0-10)
+        perp_ratio = results['perplexity_analysis']['perplexity_ratio']
+        perp_score = min(10.0, max(0.0, (perp_ratio - 1.0) * 5.0))
+        
+        # Accuracy impact score (0-10)
+        acc_scores = []
+        for task, analysis in results['accuracy_analyses'].items():
+            if 'accuracy_drop' in analysis:
+                acc_drop = analysis['accuracy_drop']
+                acc_score = min(10.0, max(0.0, acc_drop * 20.0))  # Scale to 0-10
+                acc_scores.append(acc_score)
+        
+        avg_acc_score = np.mean(acc_scores) if acc_scores else 0.0
+        
+        # Combined score (weighted average)
+        overall_score = 0.6 * perp_score + 0.4 * avg_acc_score
+        
+        return {
+            'overall_score': overall_score,
+            'perplexity_score': perp_score,
+            'accuracy_score': avg_acc_score,
+            'impact_classification': self._classify_overall_impact(overall_score)
+        }
+    
+    def _classify_overall_impact(self, score: float) -> str:
+        """Classify overall impact based on combined score"""
+        if score > 8.0:
+            return "critical"
+        elif score > 6.0:
+            return "high"
+        elif score > 4.0:
+            return "medium"
+        elif score > 2.0:
+            return "low"
+        else:
+            return "minimal"

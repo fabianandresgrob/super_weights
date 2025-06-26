@@ -1,0 +1,22 @@
+{
+    "regular_models": [
+        "meta-llama/Llama-2-7b-hf",
+        "meta-llama/Llama-2-13b-hf",
+        "meta-llama/Llama-3.1-8B",
+        "meta-llama/Llama-3.2-3B",
+        "mistralai/Mistral-7B-v0.1",
+        "allenai/OLMo-1B-0724-hf",
+        "allenai/OLMo-7B-0724-hf",
+        "microsoft/Phi-3-mini-4k-instruct",
+        "microsoft/phi-4"
+    ],
+    "moe_models": [
+        "Qwen/Qwen1.5-MoE-A2.7B",
+        "deepseek-ai/deepseek-moe-16b-base",
+        "allenai/OLMoE-1B-7B-0924"
+    ],
+    "large_moe_models": [
+        "mistralai/Mixtral-8x7B-v0.1",
+        "microsoft/Phi-3.5-MoE-instruct"
+    ]
+}

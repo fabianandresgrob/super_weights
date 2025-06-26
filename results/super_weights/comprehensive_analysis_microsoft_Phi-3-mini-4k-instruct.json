@@ -1,0 +1,98 @@
+{
+  "model_name": "microsoft-Phi-3-mini-4k-instruct",
+  "num_layers": 32,
+  "total_super_weights": 7,
+  "super_weights": [
+    {
+      "layer": 2,
+      "coordinates": [
+        525,
+        808
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 540.5,
+      "output_value": -1800.0,
+      "iteration_found": 1,
+      "magnitude_product": 972900.0,
+      "original_value": -2.921875
+    },
+    {
+      "layer": 4,
+      "coordinates": [
+        525,
+        2723
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 593.5,
+      "output_value": -1560.0,
+      "iteration_found": 1,
+      "magnitude_product": 925860.0,
+      "original_value": -2.578125
+    },
+    {
+      "layer": 2,
+      "coordinates": [
+        1693,
+        808
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 540.5,
+      "output_value": 1435.0,
+      "iteration_found": 2,
+      "magnitude_product": 775617.5,
+      "original_value": 1.71875
+    },
+    {
+      "layer": 2,
+      "coordinates": [
+        1113,
+        808
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 540.5,
+      "output_value": -1263.0,
+      "iteration_found": 3,
+      "magnitude_product": 682651.5,
+      "original_value": -1.734375
+    },
+    {
+      "layer": 4,
+      "coordinates": [
+        1113,
+        2723
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 541.0,
+      "output_value": -924.0,
+      "iteration_found": 3,
+      "magnitude_product": 499884.0,
+      "original_value": -1.671875
+    },
+    {
+      "layer": 4,
+      "coordinates": [
+        1693,
+        2723
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 1866.0,
+      "output_value": 3042.0,
+      "iteration_found": 4,
+      "magnitude_product": 5676372.0,
+      "original_value": 1.609375
+    },
+    {
+      "layer": 4,
+      "coordinates": [
+        2046,
+        2723
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 1866.0,
+      "output_value": -656.0,
+      "iteration_found": 5,
+      "magnitude_product": 1224096.0,
+      "original_value": -0.349609375
+    }
+  ]
+}

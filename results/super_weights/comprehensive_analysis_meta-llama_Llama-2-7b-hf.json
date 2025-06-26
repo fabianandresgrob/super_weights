@@ -1,0 +1,85 @@
+{
+  "model_name": "meta-llama-Llama-2-7b-hf",
+  "num_layers": 32,
+  "total_super_weights": 6,
+  "super_weights": [
+    {
+      "layer": 1,
+      "coordinates": [
+        2533,
+        7890
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 1390.0,
+      "output_value": 2242.0,
+      "iteration_found": 1,
+      "magnitude_product": 3116380.0,
+      "original_value": 1.5625
+    },
+    {
+      "layer": 30,
+      "coordinates": [
+        2533,
+        3721
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 1037.0,
+      "output_value": -2170.0,
+      "iteration_found": 1,
+      "magnitude_product": 2250290.0,
+      "original_value": -1.3046875
+    },
+    {
+      "layer": 1,
+      "coordinates": [
+        1415,
+        7890
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 1390.0,
+      "output_value": -1325.0,
+      "iteration_found": 2,
+      "magnitude_product": 1841750.0,
+      "original_value": -0.921875
+    },
+    {
+      "layer": 29,
+      "coordinates": [
+        2533,
+        5162
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 88.9375,
+      "output_value": -88.5625,
+      "iteration_found": 2,
+      "magnitude_product": 7876.52734375,
+      "original_value": -0.953125
+    },
+    {
+      "layer": 30,
+      "coordinates": [
+        1415,
+        3721
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 9760.0,
+      "output_value": 10528.0,
+      "iteration_found": 2,
+      "magnitude_product": 102753280.0,
+      "original_value": 0.75390625
+    },
+    {
+      "layer": 29,
+      "coordinates": [
+        1415,
+        5162
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 282.25,
+      "output_value": 137.625,
+      "iteration_found": 3,
+      "magnitude_product": 38844.65625,
+      "original_value": 0.48046875
+    }
+  ]
+}

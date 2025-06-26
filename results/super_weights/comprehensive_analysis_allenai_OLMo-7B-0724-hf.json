@@ -1,0 +1,72 @@
+{
+  "model_name": "allenai-OLMo-7B-0724-hf",
+  "num_layers": 32,
+  "total_super_weights": 5,
+  "super_weights": [
+    {
+      "layer": 1,
+      "coordinates": [
+        269,
+        7467
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 176.0,
+      "output_value": 248.0,
+      "iteration_found": 1,
+      "magnitude_product": 43648.0,
+      "original_value": 1.314453125
+    },
+    {
+      "layer": 2,
+      "coordinates": [
+        269,
+        8275
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 250.125,
+      "output_value": 351.5,
+      "iteration_found": 1,
+      "magnitude_product": 87918.9375,
+      "original_value": 1.3291015625
+    },
+    {
+      "layer": 7,
+      "coordinates": [
+        269,
+        453
+      ],
+      "component": "mlp.down_proj",
+      "input_value": 192.0,
+      "output_value": 192.375,
+      "iteration_found": 1,
+      "magnitude_product": 36936.0,
+      "original_value": -0.92236328125
+    },
+    {
+      "layer": 24,
+      "coordinates": [
+        269,
+        2300
+      ],
+      "component": "mlp.down_proj",
+      "input_value": -204.875,
+      "output_value": 277.5,
+      "iteration_found": 1,
+      "magnitude_product": 56852.8125,
+      "original_value": -1.2705078125
+    },
+    {
+      "layer": 30,
+      "coordinates": [
+        269,
+        10093
+      ],
+      "component": "mlp.down_proj",
+      "input_value": -336.0,
+      "output_value": -418.25,
+      "iteration_found": 1,
+      "magnitude_product": 140532.0,
+      "original_value": 0.98974609375
+    }
+  ]
+}
