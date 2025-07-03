@@ -54,6 +54,7 @@ class SuperWeightResearchSession:
     def from_model_name(cls, model_name: str, 
                        model_kwargs: Dict = None,
                        tokenizer_kwargs: Dict = None,
+                       cache_dir: str = None,
                        log_level=logging.INFO):
         """
         Create a research session from a model name.
@@ -62,6 +63,7 @@ class SuperWeightResearchSession:
             model_name: HuggingFace model identifier
             model_kwargs: Optional arguments for model loading
             tokenizer_kwargs: Optional arguments for tokenizer loading
+            cache_dir: Optional cache directory path (e.g., ~/models/)
             log_level: Logging level
             
         Returns:
@@ -72,6 +74,13 @@ class SuperWeightResearchSession:
         
         if tokenizer_kwargs is None:
             tokenizer_kwargs = {}
+        
+        # Set cache directory if provided
+        if cache_dir is not None:
+            from pathlib import Path
+            cache_path = Path(cache_dir).expanduser()
+            model_kwargs["cache_dir"] = str(cache_path)
+            tokenizer_kwargs["cache_dir"] = str(cache_path)
         
         # Load model and tokenizer
         model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
