@@ -91,15 +91,15 @@ Examples:
     parser.add_argument(
         "--download-path",
         type=str,
-        default="../models/",
-        help="Path where to download the models (default: ../models/)"
+        default="~/models/",
+        help="Path where to download the models (default: ~/models/)"
     )
     
     parser.add_argument(
         "--model-list",
         type=str,
-        default="utils/model_list.json",
-        help="Path to the model list JSON file (default: utils/model_list.json)"
+        default="model_list.json",
+        help="Path to the model list JSON file (default: model_list.json)"
     )
     
     parser.add_argument(
@@ -134,7 +134,7 @@ Examples:
         return 0
     
     # Create download directory if it doesn't exist
-    download_path = Path(args.download_path)
+    download_path = Path(args.download_path).expanduser()
     download_path.mkdir(parents=True, exist_ok=True)
     print(f"Download directory: {download_path.absolute()}")
     
