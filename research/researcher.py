@@ -74,13 +74,22 @@ class SuperWeightResearchSession:
         
         if tokenizer_kwargs is None:
             tokenizer_kwargs = {}
-        
-        # Set cache directory if provided
+
+        # Handle cache directory and local model detection
         if cache_dir is not None:
             from pathlib import Path
             cache_path = Path(cache_dir).expanduser()
-            model_kwargs["cache_dir"] = str(cache_path)
-            tokenizer_kwargs["cache_dir"] = str(cache_path)
+
+            # Check if model exists in our download format (with underscores)
+            local_model_path = cache_path / model_name.replace("/", "_")
+            if local_model_path.exists():
+                print(f"Found locally downloaded model at {local_model_path}")
+                model_name = str(local_model_path)
+                model_kwargs["local_files_only"] = True
+            else:
+                # Use HuggingFace's cache format
+                model_kwargs["cache_dir"] = str(cache_path)
+                tokenizer_kwargs["cache_dir"] = str(cache_path)
         
         # Load model and tokenizer
         model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
