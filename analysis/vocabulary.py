@@ -15,11 +15,11 @@ class VocabularyAnalyzer:
     Adapted from Universal Neurons methodology.
     """
 
-    def __init__(self, model, tokenizer, manager, results_dir: str = "results"):
+    def __init__(self, model, tokenizer, manager, mlp_handler: UniversalMLPHandler, results_dir: str = "results"):
         self.model = model
         self.tokenizer = tokenizer
         self.manager = manager
-        self.mlp_handler = UniversalMLPHandler(model)
+        self.mlp_handler = mlp_handler  # Use passed handler instead of creating new one
         self.results_manager = VocabularyResultsManager(results_dir)
     
     def analyze_vocabulary_effects(self, super_weight: SuperWeight, 

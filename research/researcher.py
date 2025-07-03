@@ -2,9 +2,10 @@ import logging
 from typing import Dict, Any, List, Optional
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from detection.detector import SuperWeightDetector, BaseSuperWeightDetector, MoESuperWeightDetector
+from detection.detector import SuperWeightDetector, MoESuperWeightDetector
 from management.manager import SuperWeightManager
 from analysis.analyzer import SuperWeightAnalyzer
+from utils.model_architectures import UniversalMLPHandler, MLPArchitectureType
 
 
 class SuperWeightResearchSession:
@@ -20,35 +21,79 @@ class SuperWeightResearchSession:
         # Setup logging
         self.logger = self._setup_logger(log_level)
         
-        # Choose appropriate detector based on model architecture
-        self.detector = self._create_detector(model, tokenizer, log_level)
+        # Create single MLP handler for the session
+        self.mlp_handler = UniversalMLPHandler(model)
         
-        # Initialize other components
-        self.manager = SuperWeightManager(model, log_level)
-        self.analyzer = SuperWeightAnalyzer(model, tokenizer, self.manager, log_level)
+        # Analyze architecture once
+        self.model_info = self._analyze_model_architecture()
+        
+        # Create appropriate detector based on architecture
+        self.detector = self._create_detector(log_level)
+        
+        # Initialize other components with shared handler
+        self.manager = SuperWeightManager(model, self.mlp_handler, log_level)  # Pass handler
+        self.analyzer = SuperWeightAnalyzer(model, tokenizer, self.manager, self.mlp_handler, log_level)
         
         # State tracking
         self.detected_super_weights = []
         self.analysis_history = []
         
         self.logger.info("SuperWeightResearchSession initialized")
+        self.logger.info(f"Model: {self.model_info['model_name']}")
+        self.logger.info(f"Architecture: {self.model_info['architecture']}")
         self.logger.info(f"Using detector: {type(self.detector).__name__}")
     
-    def _create_detector(self, model, tokenizer, log_level):
-        """Create appropriate detector based on model architecture"""
-        # Create a temporary detector to analyze architecture
-        temp_detector = BaseSuperWeightDetector(model, tokenizer, log_level)
+    def _analyze_model_architecture(self) -> Dict[str, Any]:
+        """Analyze model architecture using the MLP handler"""
+        model_name = getattr(self.model, 'name_or_path', 'unknown').replace('/', '-')
         
-        if temp_detector.model_info['is_moe']:
-            self.logger.info(f"Detected MoE architecture: {temp_detector.model_info['architecture']}")
+        # Use MLP handler's layer-by-layer MoE detection
+        moe_layers = [i for i in range(len(self.mlp_handler.layers)) if self.mlp_handler.is_moe_layer(i)]
+        is_moe = len(moe_layers) > 0
+        architecture = MLPArchitectureType.STANDARD_MLP.value  # Use enum value
+        
+        if is_moe:
+            # Get architecture type from first MoE layer
+            first_moe_layer_idx = moe_layers[0]
+            arch_info = self.mlp_handler.get_mlp_architecture(first_moe_layer_idx)
+            if arch_info.is_moe and arch_info.moe_info:
+                # Use enum values directly
+                architecture = arch_info.architecture_type.value
+        else:
+            # For non-MoE models, detect the actual architecture type
+            try:
+                # Get architecture from first layer
+                arch_info = self.mlp_handler.get_mlp_architecture(0)
+                architecture = arch_info.architecture_type.value
+            except Exception:
+                # Fallback to standard if detection fails
+                architecture = MLPArchitectureType.STANDARD_MLP.value
+
+        return {
+            'model_name': model_name,
+            'is_moe': is_moe,
+            'architecture': architecture,
+            'num_layers': len(self.mlp_handler.layers),
+            'moe_layers': moe_layers  # Use the computed list instead of accessing _moe_layers
+        }
+    
+    def _create_detector(self, log_level):
+        """Create appropriate detector based on model architecture"""
+        if self.model_info['is_moe']:
             return MoESuperWeightDetector(
-                model, tokenizer, 
-                architecture_type=temp_detector.model_info['architecture'],
+                model=self.model,
+                tokenizer=self.tokenizer,
+                mlp_handler=self.mlp_handler,
+                architecture_type=self.model_info['architecture'],
                 log_level=log_level
             )
         else:
-            self.logger.info("Detected standard transformer architecture")
-            return SuperWeightDetector(model, tokenizer, log_level)
+            return SuperWeightDetector(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                mlp_handler=self.mlp_handler,
+                log_level=log_level
+            )
     
     @classmethod
     def from_model_name(cls, model_name: str, 

@@ -17,10 +17,10 @@ class SuperActivationAnalyzer:
     Works across different transformer architectures by detecting and adapting to their MLP structures.
     """
     
-    def __init__(self, model, tokenizer, log_level=logging.INFO):
+    def __init__(self, model, tokenizer, mlp_handler: UniversalMLPHandler, log_level=logging.INFO):
         self.model = model
         self.tokenizer = tokenizer
-        self.mlp_handler = UniversalMLPHandler(model)
+        self.mlp_handler = mlp_handler  # Use passed handler instead of creating new one
         
         # Setup logging
         self.logger = self._setup_logger(log_level)
@@ -64,17 +64,17 @@ class SuperActivationAnalyzer:
         
         # Detect architecture
         arch_info = self.mlp_handler.get_mlp_architecture(target_layer)
-        self.logger.info(f"Detected architecture: {arch_info}")
+        self.logger.info(f"Detected architecture: {arch_info.architecture_type}")
         
         # Get input vector
         input_vector = self._extract_mlp_input_vector(input_text, target_layer)
         
-        # Extract weights and biases
+        # Extract weights and biases using the handler
         weights = self.mlp_handler.extract_weights(target_layer)
         biases = self.mlp_handler.extract_biases(target_layer)
         
         # Perform architecture-specific analysis
-        if arch_info.architecture_type == MLPArchitectureType.GATED_MLP:
+        if arch_info.architecture_type in [MLPArchitectureType.GATED_MLP, MLPArchitectureType.FUSED_GATED_MLP]:
             return self._analyze_gated_mlp(
                 input_vector, weights, biases, target_channel, arch_info, super_weight
             )
@@ -92,17 +92,30 @@ class SuperActivationAnalyzer:
                           target_channel: int,
                           arch_info,
                           super_weight: SuperWeight) -> Dict[str, Any]:
-        """Analyze gated MLP architecture (LLaMA, OLMo, Mistral, etc.)"""
+        """Analyze gated MLP architecture - now supports all gated types including fused"""
         
         x = input_vector.cpu().numpy()
-        W_gate = weights['gate'].cpu().numpy()
-        W_up = weights['up'].cpu().numpy()
-        W_down = weights['down'].cpu().numpy()
         
-        b_gate = biases['gate'].cpu().numpy() if biases['gate'] is not None else None
-        b_up = biases['up'].cpu().numpy() if biases['up'] is not None else None
-        b_down = biases['down'].cpu().numpy() if biases['down'] is not None else None
-        
+        # Handle different gated architectures using the handler's extracted weights
+        if arch_info.architecture_type == MLPArchitectureType.FUSED_GATED_MLP:
+            # For fused gate+up, weights are already split by the handler
+            W_gate = weights['gate'].cpu().numpy()
+            W_up = weights['up'].cpu().numpy()
+            W_down = weights['down'].cpu().numpy()
+            
+            b_gate = biases['gate'].cpu().numpy() if biases['gate'] is not None else None
+            b_up = biases['up'].cpu().numpy() if biases['up'] is not None else None
+            b_down = biases['down'].cpu().numpy() if biases['down'] is not None else None
+            
+        else:  # Standard gated MLP
+            W_gate = weights['gate'].cpu().numpy()
+            W_up = weights['up'].cpu().numpy()
+            W_down = weights['down'].cpu().numpy()
+            
+            b_gate = biases['gate'].cpu().numpy() if biases['gate'] is not None else None
+            b_up = biases['up'].cpu().numpy() if biases['up'] is not None else None
+            b_down = biases['down'].cpu().numpy() if biases['down'] is not None else None
+    
         analysis_results = {
             'super_weight': super_weight,
             'architecture_info': arch_info,

@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional
 from datasets import load_dataset
 
 from detection.super_weight import SuperWeight
+from utils.model_architectures import UniversalMLPHandler
 
 
 class MetricsAnalyzer:
@@ -11,10 +12,11 @@ class MetricsAnalyzer:
     Analyzes performance metrics (perplexity, accuracy) with super weight modifications.
     """
     
-    def __init__(self, model, tokenizer, manager):
+    def __init__(self, model, tokenizer, manager, mlp_handler: UniversalMLPHandler):
         self.model = model
         self.tokenizer = tokenizer
         self.manager = manager
+        self.mlp_handler = mlp_handler  # Use passed handler instead of creating new one
         
         # Add padding token if not present
         if self.tokenizer.pad_token is None:

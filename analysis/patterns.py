@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Tuple
 from collections import defaultdict
 
 from detection.super_weight import SuperWeight
+from utils.model_architectures import UniversalMLPHandler
 
 
 class PatternsAnalyzer:
@@ -11,10 +12,11 @@ class PatternsAnalyzer:
     Analyzes patterns in super weight locations, activations, and effects.
     """
     
-    def __init__(self, model, tokenizer, manager):
+    def __init__(self, model, tokenizer, manager, mlp_handler: UniversalMLPHandler):
         self.model = model
         self.tokenizer = tokenizer
         self.manager = manager
+        self.mlp_handler = mlp_handler  # Use passed handler instead of creating new one
     
     def analyze_spatial_patterns(self, super_weights: List[SuperWeight]) -> Dict[str, Any]:
         """

@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional
 import matplotlib.pyplot as plt
 
 from detection.super_weight import SuperWeight
+from utils.model_architectures import UniversalMLPHandler
 from .vocabulary import VocabularyAnalyzer
 from .metrics import MetricsAnalyzer
 from .patterns import PatternsAnalyzer
@@ -18,16 +19,17 @@ class SuperWeightAnalyzer:
     Provides a unified interface for vocabulary, metrics, and pattern analysis.
     """
     
-    def __init__(self, model, tokenizer, manager, log_level=logging.INFO):
+    def __init__(self, model, tokenizer, manager, mlp_handler: UniversalMLPHandler, log_level=logging.INFO):
         self.model = model
         self.tokenizer = tokenizer
         self.manager = manager
+        self.mlp_handler = mlp_handler  # Use passed handler
         
-        # Initialize specialized analyzers
-        self.vocabulary_analyzer = VocabularyAnalyzer(model, tokenizer, manager)
-        self.metrics_analyzer = MetricsAnalyzer(model, tokenizer, manager)
-        self.patterns_analyzer = PatternsAnalyzer(model, tokenizer, manager)
-        self.super_activation_analyzer = SuperActivationAnalyzer(model, tokenizer, log_level)
+        # Initialize specialized analyzers with the shared handler
+        self.vocabulary_analyzer = VocabularyAnalyzer(model, tokenizer, manager, mlp_handler)
+        self.metrics_analyzer = MetricsAnalyzer(model, tokenizer, manager, mlp_handler)
+        self.patterns_analyzer = PatternsAnalyzer(model, tokenizer, manager, mlp_handler)
+        self.super_activation_analyzer = SuperActivationAnalyzer(model, tokenizer, mlp_handler, log_level)  # Pass handler
         
         # Setup logging
         self.logger = self._setup_logger(log_level)
@@ -620,4 +622,3 @@ class SuperWeightAnalyzer:
             return obj.item()
         else:
             return obj
-        

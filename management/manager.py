@@ -1,9 +1,10 @@
 import torch
 import logging
-from typing import Dict, List, Set, Union, Tuple
+from typing import Dict, List, Set, Union, Tuple, Optional
 from contextlib import contextmanager
 
 from detection.super_weight import SuperWeight
+from utils.model_architectures import UniversalMLPHandler
 
 
 class SuperWeightManager:
@@ -12,8 +13,9 @@ class SuperWeightManager:
     Provides safe manipulation of super weights with context managers.
     """
     
-    def __init__(self, model, log_level=logging.INFO):
+    def __init__(self, model, mlp_handler: UniversalMLPHandler, log_level=logging.INFO):
         self.model = model
+        self.mlp_handler = mlp_handler
         self.original_values: Dict[SuperWeight, torch.Tensor] = {}
         self.current_scales: Dict[SuperWeight, float] = {}
         self.currently_modified: Set[SuperWeight] = set()
@@ -21,8 +23,7 @@ class SuperWeightManager:
         # Setup logging
         self.logger = self._setup_logger(log_level)
         
-        # Model architecture info
-        self._analyze_model_architecture()
+        self.logger.info("SuperWeightManager initialized with shared MLP handler")
     
     def _setup_logger(self, log_level) -> logging.Logger:
         """Setup logging for the manager"""
@@ -39,46 +40,48 @@ class SuperWeightManager:
         
         return logger
     
-    def _analyze_model_architecture(self):
-        """Analyze the model architecture to understand layer structure"""
-        if hasattr(self.model, "model"):
-            self.model_body = self.model.model
-        else:
-            self.model_body = self.model
+    def _get_weight_module(self, super_weight: SuperWeight) -> torch.nn.Module:
+        """Get the weight module for a super weight using the MLP handler"""
+        layer_idx = super_weight.layer
         
-        if hasattr(self.model_body, "layers"):
-            self.layers_attr = "layers"
-        elif hasattr(self.model_body, "encoder"):
-            self.layers_attr = "encoder.layer"
-        else:
-            raise ValueError("Unsupported model architecture")
-        
-        self.layers = eval(f"self.model_body.{self.layers_attr}")
-    
-    def _get_mlp_component_info(self, layer) -> Tuple[str, str, torch.nn.Module]:
-        """Get MLP component information for a layer"""
-        if hasattr(layer, "mlp"):
-            base = "mlp"
-            if hasattr(layer.mlp, "down_proj"):
-                down_name = "down_proj"
-                module = layer.mlp.down_proj
-            elif hasattr(layer.mlp, "c_proj"):
-                down_name = "c_proj"
-                module = layer.mlp.c_proj
-            elif hasattr(layer.mlp, "dense_h_to_4h") and hasattr(layer.mlp, "dense_4h_to_h"):
-                down_name = "dense_4h_to_h"
-                module = layer.mlp.dense_4h_to_h
+        # Check if this is an MoE layer
+        if self.mlp_handler.is_moe_layer(layer_idx):
+            # For MoE, we need to parse the component path
+            if hasattr(super_weight, 'component') and super_weight.component:
+                # Parse component path like "experts.0.down_proj"
+                parts = super_weight.component.split('.')
+                if len(parts) >= 3 and parts[0] == 'experts':
+                    expert_idx = int(parts[1])
+                    component_name = parts[2]
+                    
+                    # Get expert components
+                    expert_components = self.mlp_handler.get_expert_components(layer_idx, expert_idx)
+                    
+                    # Find the right component
+                    for comp_type, module in expert_components.items():
+                        arch_info = self.mlp_handler.get_mlp_architecture(layer_idx)
+                        expert_info = arch_info.moe_info.experts[expert_idx]
+                        comp_info = expert_info.components[comp_type]
+                        
+                        if comp_info.component_name == component_name:
+                            return module
+                    
+                    raise ValueError(f"Component {component_name} not found in expert {expert_idx}")
+                else:
+                    raise ValueError(f"Invalid MoE component path: {super_weight.component}")
             else:
-                down_name = "fc2"
-                module = layer.mlp.fc2
-        elif hasattr(layer, "feed_forward"):
-            base = "feed_forward"
-            down_name = "output_dense"
-            module = layer.feed_forward.output_dense
+                raise ValueError(f"MoE super weight missing component information: {super_weight}")
         else:
-            raise ValueError(f"Unsupported MLP structure in layer: {dir(layer)}")
-        
-        return base, down_name, module
+            # Regular MLP layer
+            components = self.mlp_handler.get_mlp_components(layer_idx)
+            
+            # Find the output/down projection component
+            if 'down' in components:
+                return components['down']
+            elif 'output' in components:
+                return components['output']
+            else:
+                raise ValueError(f"No output projection found in layer {layer_idx}")
     
     def scale_super_weights(self, super_weights: List[SuperWeight], scale_factor: float) -> bool:
         """
@@ -95,12 +98,12 @@ class SuperWeightManager:
         
         for sw in super_weights:
             try:
-                layer = self.layers[sw.layer]
-                _, _, module = self._get_mlp_component_info(layer)
-                weight_matrix = module.weight
+                # Get the weight module using MLP handler
+                weight_module = self._get_weight_module(sw)
+                weight_matrix = weight_module.weight
                 
                 if weight_matrix.device.type == 'meta':
-                    self.logger.error(f"Weight matrix for layer {sw.layer} is on meta device. Skipping.")
+                    self.logger.error(f"Weight matrix for {sw} is on meta device. Skipping.")
                     continue
                 
                 # Backup original value if not already done
@@ -146,9 +149,8 @@ class SuperWeightManager:
         for sw in super_weights:
             try:
                 if sw in self.original_values:
-                    layer = self.layers[sw.layer]
-                    _, _, module = self._get_mlp_component_info(layer)
-                    module.weight.data[sw.row, sw.column] = self.original_values[sw]
+                    weight_module = self._get_weight_module(sw)
+                    weight_module.weight.data[sw.row, sw.column] = self.original_values[sw]
                     
                     # Update tracking
                     self.current_scales.pop(sw, None)
@@ -190,9 +192,8 @@ class SuperWeightManager:
     def get_current_value(self, super_weight: SuperWeight) -> torch.Tensor:
         """Get the current value of a super weight"""
         try:
-            layer = self.layers[super_weight.layer]
-            _, _, module = self._get_mlp_component_info(layer)
-            return module.weight[super_weight.row, super_weight.column].clone()
+            weight_module = self._get_weight_module(super_weight)
+            return weight_module.weight[super_weight.row, super_weight.column].clone()
         except Exception as e:
             self.logger.error(f"Error getting current value for {super_weight}: {e}")
             return None
@@ -241,8 +242,38 @@ class SuperWeightManager:
             ]
         }
     
+    def validate_super_weights(self, super_weights: List[SuperWeight]) -> List[SuperWeight]:
+        """
+        Validate that super weights are compatible with the current model architecture.
+        
+        Args:
+            super_weights: List of SuperWeight objects to validate
+            
+        Returns:
+            List of valid SuperWeight objects
+        """
+        valid_weights = []
+        
+        for sw in super_weights:
+            try:
+                # Try to get the weight module - this will validate the architecture
+                weight_module = self._get_weight_module(sw)
+                weight_shape = weight_module.weight.shape
+                
+                # Check if coordinates are within bounds
+                if 0 <= sw.row < weight_shape[0] and 0 <= sw.column < weight_shape[1]:
+                    valid_weights.append(sw)
+                else:
+                    self.logger.warning(f"Super weight {sw} coordinates out of bounds for shape {weight_shape}")
+                    
+            except Exception as e:
+                self.logger.warning(f"Super weight {sw} is invalid: {e}")
+        
+        self.logger.info(f"Validated {len(valid_weights)}/{len(super_weights)} super weights")
+        return valid_weights
+    
     def __enter__(self):
-        """Context manager entry - for backwards compatibility"""
+        """Context manager entry"""
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
