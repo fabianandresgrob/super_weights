@@ -7,6 +7,7 @@ from datasets import load_dataset
 from detection.super_weight import SuperWeight
 from utils.model_architectures import UniversalMLPHandler
 from analysis.results_manager import VocabularyResultsManager
+from utils.device_utils import safe_matmul
 
 
 class VocabularyAnalyzer:
@@ -110,28 +111,28 @@ class VocabularyAnalyzer:
                     unembedding_matrix = self.model.embed_out.weight
                 else:
                     # Try to find unembedding matrix
-                    unembedding_matrix = self.model.model.embed_tokens.weight
-                
-                # Compute vocabulary effects: W_U @ w_out
-                vocab_effects = torch.matmul(neuron_output_vector, unembedding_matrix.T).cpu()
-                
-                # Analyze the effects using same methods as intervention analysis
-                statistics = self._compute_effect_statistics(vocab_effects)
-                classification = self._classify_super_weight_function(vocab_effects)
-                top_tokens = self._get_top_affected_tokens(vocab_effects)
-                patterns = self._analyze_token_patterns(vocab_effects)
-                
-                return {
-                    'super_weight': super_weight,
-                    'analysis_type': 'neuron_direct',
-                    'neuron_coordinates': (super_weight.layer, super_weight.row),
-                    'vocab_effects': vocab_effects.numpy(),
-                    'statistics': statistics,
-                    'classification': classification,
-                    'top_tokens': top_tokens,
-                    'patterns': patterns,
-                    'neuron_output_norm': float(torch.norm(neuron_output_vector))
-                }
+                    unembedding_matrix = self.model.model.embed_tokens.weight            
+            
+                # Compute vocabulary effects safely (result always on CPU)
+                vocab_effects = safe_matmul(neuron_output_vector, unembedding_matrix.T)
+            
+            # Analyze the effects using same methods as intervention analysis
+            statistics = self._compute_effect_statistics(vocab_effects)
+            classification = self._classify_super_weight_function(vocab_effects)
+            top_tokens = self._get_top_affected_tokens(vocab_effects)
+            patterns = self._analyze_token_patterns(vocab_effects)
+            
+            return {
+                'super_weight': super_weight,
+                'analysis_type': 'neuron_direct',
+                'neuron_coordinates': (super_weight.layer, super_weight.row),
+                'vocab_effects': vocab_effects.numpy(),
+                'statistics': statistics,
+                'classification': classification,
+                'top_tokens': top_tokens,
+                'patterns': patterns,
+                'neuron_output_norm': float(torch.norm(neuron_output_vector))
+            }
             
         except Exception as e:
             return {
@@ -826,7 +827,7 @@ class VocabularyAnalyzer:
                 
                 # Ensure both tensors are on the same device
                 residual_diff = residual_diff.to(unembedding_matrix.device)
-                layer_vocab_effect = torch.matmul(residual_diff, unembedding_matrix.T).cpu()
+                layer_vocab_effect = safe_matmul(residual_diff, unembedding_matrix.T, result_device='cpu')
                 
                 # Accumulate effects
                 cumulative_effect += layer_vocab_effect
@@ -975,20 +976,20 @@ class VocabularyAnalyzer:
                     x = self.model.ln_f(x)
                     activation = x[0, 0, :]
                 
-                # Project to vocabulary space
+                # Project to vocabulary space - NEED SAFE_MATMUL HERE
                 if hasattr(self.model, 'lm_head'):
-                    logits = torch.matmul(activation, self.model.lm_head.weight.T)
+                    logits = safe_matmul(activation, self.model.lm_head.weight.T, result_device='cpu')
                 elif hasattr(self.model, 'embed_out'):
-                    logits = torch.matmul(activation, self.model.embed_out.weight.T)
+                    logits = safe_matmul(activation, self.model.embed_out.weight.T, result_device='cpu')
                 elif hasattr(self.model.model, 'embed_tokens'):
                     # Use embedding matrix transpose (tied weights)
-                    logits = torch.matmul(activation, self.model.model.embed_tokens.weight.T)
+                    logits = safe_matmul(activation, self.model.model.embed_tokens.weight.T, result_device='cpu')
                 else:
                     # Last resort: zero logits
                     logits = torch.zeros(self.model.config.vocab_size, device=activation.device)
                 
                 return logits.cpu()
-                
+            
         except Exception as e:
             print(f"Error in direct projection: {e}")
             # Return zero logits as ultimate fallback
