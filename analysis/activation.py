@@ -40,6 +40,7 @@ class SuperActivationAnalyzer:
         
         return logger
     
+    @torch.no_grad()
     def mathematical_super_activation_analysis(self, 
                                              super_weight: SuperWeight, 
                                              input_text: str = "Apple Inc. is a worldwide tech company.") -> Dict[str, Any]:
@@ -741,3 +742,75 @@ class SuperActivationAnalyzer:
             hook.remove()
         
         return input_vector
+    
+    def gradient_based_gate_attack(self, super_weight: SuperWeight, 
+                                 input_text: str = "Apple Inc. is a tech company.",
+                                 learning_rate: float = 0.01,
+                                 max_iterations: int = 1000) -> Dict[str, Any]:
+        """
+        Use gradient descent to find input modifications that zero gate outputs
+        """
+        from attack.attack import GradientGateZeroingAttack
+        
+        # Initialize attack system
+        attack_system = GradientGateZeroingAttack(self.model, self.tokenizer, self.mlp_handler)
+        
+        # Extract target channel from super weight coordinates
+        target_channel = super_weight.column  # Column index is the channel
+        
+        # Run the attack
+        result = attack_system.attack_gate_output(
+            input_text=input_text,
+            target_layer=super_weight.layer,
+            target_channel=target_channel,
+            learning_rate=learning_rate,
+            max_iterations=max_iterations,
+            target_value=0.0,
+            loss_type='mse'
+        )
+        
+        return {
+            'super_weight': super_weight,
+            'attack_type': 'gradient_based_gate_zeroing',
+            'attack_result': result,
+            'success_metrics': {
+                'gate_zeroing_achieved': result['success'],
+                'reduction_percentage': result['reduction_percentage'],
+                'perturbation_efficiency': result['perturbation_l2_norm'],
+                'convergence_iterations': result['iterations_used']
+            }
+        }
+    
+    def compare_attack_methods(self, super_weight: SuperWeight, 
+                             input_text: str = "Apple Inc. is a tech company.") -> Dict[str, Any]:
+        """
+        Compare gradient-based attack with mathematical attack vectors
+        """
+        # Get mathematical analysis
+        math_analysis = self.analyze_super_activation(input_text, super_weight)
+        
+        # Get gradient-based attack
+        grad_attack = self.gradient_based_gate_attack(super_weight, input_text)
+        
+        # Extract key metrics for comparison
+        math_attacks = math_analysis.get('attack_vectors', {})
+        grad_result = grad_attack['attack_result']
+        
+        comparison = {
+            'mathematical_methods': {
+                'zero_gate_feasibility': math_attacks.get('zero_gate_attack', {}).get('feasibility', 'unknown'),
+                'minimal_perturbation': math_attacks.get('minimal_perturbation_attack', {}).get('perturbation_magnitude', float('inf')),
+                'theoretical_reduction': 100.0  # Mathematical methods achieve perfect zeroing
+            },
+            'gradient_method': {
+                'achieved_reduction': grad_result['reduction_percentage'],
+                'actual_perturbation': grad_result['perturbation_l2_norm'],
+                'convergence_success': grad_result['success']
+            },
+            'method_agreement': {
+                'perturbation_ratio': grad_result['perturbation_l2_norm'] / math_attacks.get('minimal_perturbation_attack', {}).get('perturbation_magnitude', 1.0),
+                'both_methods_feasible': grad_result['success'] and math_attacks.get('zero_gate_attack', {}).get('feasibility') != 'low'
+            }
+        }
+        
+        return comparison
