@@ -337,14 +337,15 @@ class MoESuperWeightDetector(BaseSuperWeightDetector):
             return {}
         
         arch_info = self.mlp_handler.get_mlp_architecture(first_moe_layer)
+        routing_info = self.mlp_handler.get_routing_info(first_moe_layer)
+        
         if not arch_info.is_moe or not arch_info.moe_info:
             return {}
         
         return {
             'experts_per_layer': arch_info.moe_info.num_experts,
-            'routing_method': arch_info.moe_info.routing_method,
-            'experts_per_token': arch_info.moe_info.experts_per_token,
-            'expert_components': [list(expert.components.keys()) for expert in arch_info.moe_info.experts],
+            'routing_method': routing_info.routing_type.value if routing_info else 'unknown',
+            'experts_per_token': routing_info.experts_per_token if routing_info else 1,
             'first_moe_layer': first_moe_layer
         }
     

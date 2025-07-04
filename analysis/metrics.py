@@ -22,17 +22,17 @@ class MetricsAnalyzer:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
     
-    def measure_perplexity_impact(self, super_weight: SuperWeight, 
-                                dataset_name: str = 'wikitext',
-                                dataset_config: str = 'wikitext-2-raw-v1',
-                                split: str = 'test',
-                                n_samples: int = 100,
-                                max_length: int = 512) -> Dict[str, Any]:
+    def measure_perplexity_impact(self, super_weight: SuperWeight | List[SuperWeight], 
+                            dataset_name: str = 'wikitext',
+                            dataset_config: str = 'wikitext-2-raw-v1',
+                            split: str = 'test',
+                            n_samples: int = 100,
+                            max_length: int = 512) -> Dict[str, Any]:
         """
-        Measure perplexity impact of a super weight using causal intervention.
+        Measure perplexity impact of a super weight or list of super weights using causal intervention.
         
         Args:
-            super_weight: SuperWeight to analyze
+            super_weight: SuperWeight or List[SuperWeight] to analyze
             dataset_name: HuggingFace dataset name
             dataset_config: Dataset configuration
             split: Dataset split to use
@@ -42,6 +42,14 @@ class MetricsAnalyzer:
         Returns:
             Dictionary with perplexity metrics
         """
+        
+        # Handle both single SuperWeight and list of SuperWeights
+        if isinstance(super_weight, list):
+            super_weights = super_weight
+            is_multiple = True
+        else:
+            super_weights = [super_weight]
+            is_multiple = False
         
         # Load dataset
         dataset = load_dataset(dataset_name, dataset_config, split=split, streaming=True)
@@ -63,16 +71,16 @@ class MetricsAnalyzer:
         # Measure baseline perplexity
         baseline_perplexity = self._compute_perplexity(texts, max_length)
         
-        # Measure perplexity with super weight zeroed
-        with self.manager.temporary_zero([super_weight]):
+        # Measure perplexity with super weight(s) zeroed
+        with self.manager.temporary_zero(super_weights):
             modified_perplexity = self._compute_perplexity(texts, max_length)
         
         # Calculate impact metrics
         perplexity_ratio = modified_perplexity / baseline_perplexity
         perplexity_increase = modified_perplexity - baseline_perplexity
         
-        return {
-            'super_weight': super_weight,
+        # Build result dictionary based on whether it's single or multiple
+        result = {
             'baseline_perplexity': baseline_perplexity,
             'modified_perplexity': modified_perplexity,
             'perplexity_ratio': perplexity_ratio,
@@ -85,6 +93,17 @@ class MetricsAnalyzer:
                 'n_samples': len(texts)
             }
         }
+        
+        if is_multiple:
+            result.update({
+                'super_weights': super_weights,
+                'num_weights': len(super_weights),
+                'average_impact_per_weight': perplexity_increase / len(super_weights) if super_weights else 0.0,
+            })
+        else:
+            result['super_weight'] = super_weight
+        
+        return result
     
     def _compute_perplexity(self, texts: List[str], max_length: int) -> float:
         """Compute perplexity on a list of texts"""
@@ -136,14 +155,14 @@ class MetricsAnalyzer:
         else:
             return "minimal"
     
-    def measure_accuracy_impact(self, super_weight: SuperWeight,
-                              task: str = 'hellaswag',
-                              n_samples: int = 100) -> Dict[str, Any]:
+    def measure_accuracy_impact(self, super_weight: SuperWeight | List[SuperWeight],
+                          task: str = 'hellaswag',
+                          n_samples: int = 100) -> Dict[str, Any]:
         """
         Measure accuracy impact on downstream tasks.
         
         Args:
-            super_weight: SuperWeight to analyze
+            super_weight: SuperWeight or List[SuperWeight] to analyze
             task: Task name (hellaswag, arc_easy, arc_challenge, etc.)
             n_samples: Number of samples to evaluate
             
@@ -151,28 +170,43 @@ class MetricsAnalyzer:
             Dictionary with accuracy metrics
         """
         
+        # Handle both single SuperWeight and list of SuperWeights
+        if isinstance(super_weight, list):
+            super_weights = super_weight
+            is_multiple = True
+        else:
+            super_weights = [super_weight]
+            is_multiple = False
+    
         # Load task data
         task_data = self._load_task_data(task, n_samples)
         
         if not task_data:
-            return {
+            result = {
                 'error': f"Could not load task data for {task}",
-                'super_weight': super_weight
+                'task': task
             }
+            if is_multiple:
+                result.update({
+                    'super_weights': super_weights,
+                    'num_weights': len(super_weights)
+                })
+            else:
+                result['super_weight'] = super_weight
+            return result
         
         # Measure baseline accuracy
         baseline_accuracy = self._compute_accuracy(task_data, task)
         
-        # Measure accuracy with super weight zeroed
-        with self.manager.temporary_zero([super_weight]):
+        # Measure accuracy with super weight(s) zeroed
+        with self.manager.temporary_zero(super_weights):
             modified_accuracy = self._compute_accuracy(task_data, task)
         
         # Calculate impact metrics
         accuracy_drop = baseline_accuracy - modified_accuracy
         accuracy_ratio = modified_accuracy / baseline_accuracy if baseline_accuracy > 0 else 0.0
         
-        return {
-            'super_weight': super_weight,
+        result = {
             'task': task,
             'baseline_accuracy': baseline_accuracy,
             'modified_accuracy': modified_accuracy,
@@ -181,6 +215,17 @@ class MetricsAnalyzer:
             'impact_severity': self._classify_accuracy_impact(accuracy_drop),
             'n_samples': len(task_data)
         }
+        
+        if is_multiple:
+            result.update({
+                'super_weights': super_weights,
+                'num_weights': len(super_weights),
+                'average_impact_per_weight': accuracy_drop / len(super_weights) if super_weights else 0.0,
+            })
+        else:
+            result['super_weight'] = super_weight
+    
+        return result
     
     def _load_task_data(self, task: str, n_samples: int) -> Optional[List[Dict]]:
         """Load data for a specific task"""

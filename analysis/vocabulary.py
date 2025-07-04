@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import numpy as np
 import scipy.stats
 from typing import List, Dict, Any, Optional
@@ -89,32 +90,18 @@ class VocabularyAnalyzer:
         """
         Analyze vocabulary effects of the full neuron containing the super weight.
         Uses direct computation (W_U @ w_out) like Universal Neurons paper.
-        
-        Args:
-            super_weight: SuperWeight to analyze (identifies the neuron)
-            
-        Returns:
-            Dictionary with neuron vocabulary analysis results
         """
-        
         try:
             with torch.no_grad():
-                # Get the full neuron output vector
-                layer = self._get_layer(super_weight.layer)
-                _, _, module = self._get_mlp_component_info(super_weight.layer)
-                neuron_output_vector = module.weight[:, super_weight.column].clone().detach()
+                # Get the neuron's output vector (the row from down/output projection)
+                neuron_output_weight, component_name = self._get_mlp_component_info(super_weight.layer)
+                neuron_output_vector = neuron_output_weight[super_weight.row]  # Get the row
                 
-                # Get unembedding matrix (same as lm_head weight)
-                if hasattr(self.model, 'lm_head'):
-                    unembedding_matrix = self.model.lm_head.weight
-                elif hasattr(self.model, 'embed_out'):
-                    unembedding_matrix = self.model.embed_out.weight
-                else:
-                    # Try to find unembedding matrix
-                    unembedding_matrix = self.model.model.embed_tokens.weight            
-            
-                # Compute vocabulary effects safely (result always on CPU)
-                vocab_effects = safe_matmul(neuron_output_vector, unembedding_matrix.T)
+                # Get unembedding matrix
+                unembedding_matrix = self._get_unembedding_matrix()
+                
+                # Compute direct effect: W_U @ w_out
+                vocab_effects = safe_matmul(unembedding_matrix, neuron_output_vector, result_device='cpu')
             
             # Analyze the effects using same methods as intervention analysis
             statistics = self._compute_effect_statistics(vocab_effects)
@@ -126,7 +113,7 @@ class VocabularyAnalyzer:
                 'super_weight': super_weight,
                 'analysis_type': 'neuron_direct',
                 'neuron_coordinates': (super_weight.layer, super_weight.row),
-                'vocab_effects': vocab_effects.numpy(),
+                'vocab_effects': vocab_effects.cpu().numpy(),
                 'statistics': statistics,
                 'classification': classification,
                 'top_tokens': top_tokens,
@@ -624,14 +611,32 @@ class VocabularyAnalyzer:
             # Gated architecture
             down_component = components['down']
             down_info = arch_info.components['down']
-            return "mlp", down_info.component_name, down_component
+            mlp_base = self.mlp_handler.registry.find_mlp(self.mlp_handler.layers[layer_idx])
+            return down_component.weight, down_info.component_name
         elif 'output' in components:
             # Standard architecture  
             output_component = components['output']
             output_info = arch_info.components['output']
-            return "mlp", output_info.component_name, output_component
+            mlp_base = self.mlp_handler.registry.find_mlp(self.mlp_handler.layers[layer_idx])
+            return output_component.weight, output_info.component_name
         else:
             raise ValueError(f"No down/output projection found in layer {layer_idx}")
+
+    def _get_unembedding_matrix(self) -> torch.Tensor:
+        """Get the unembedding matrix (lm_head or output projection)"""
+        # Try common names for the final projection layer
+        if hasattr(self.model, 'lm_head'):
+            return self.model.lm_head.weight
+        elif hasattr(self.model, 'output'):
+            return self.model.output.weight
+        elif hasattr(self.model, 'head'):
+            return self.model.head.weight
+        else:
+            # Search for it in the model
+            for name, module in self.model.named_modules():
+                if isinstance(module, nn.Linear) and module.weight.shape[0] == self.model.config.vocab_size:
+                    return module.weight
+            raise ValueError("Could not find unembedding matrix")
 
     def display_neuron_vs_super_weight_comparison(self, comparison_results: Dict[str, Any]) -> None:
         """
