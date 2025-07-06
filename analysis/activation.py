@@ -769,21 +769,10 @@ class SuperActivationAnalyzer:
             loss_type='mse'
         )
         
-        # Analyze the perturbation pattern
-        pattern_analysis = attack_system.analyze_perturbation_pattern(result)
-        
-        # Compare with mathematical solution
-        mathematical_analysis = self.analyze_super_activation(input_text, super_weight)
-        comparison = attack_system.compare_with_mathematical_solution(
-            result, mathematical_analysis.get('attack_vectors', {})
-        )
-        
         return {
             'super_weight': super_weight,
             'attack_type': 'gradient_based_gate_zeroing',
             'attack_result': result,
-            'perturbation_analysis': pattern_analysis,
-            'mathematical_comparison': comparison,
             'success_metrics': {
                 'gate_zeroing_achieved': result['success'],
                 'reduction_percentage': result['reduction_percentage'],

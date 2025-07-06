@@ -506,6 +506,13 @@ class UniversalLayerHandler:
     def get_mlp_architecture(self, layer_idx: int) -> MLPArchitectureInfo:
         """Get MLP architecture information for layer"""
         return self.get_layer_architecture(layer_idx).mlp_info
+
+    def get_attention_module(self, layer_idx: int) -> nn.Module:
+        """Get the complete attention module for a layer"""
+        attention_module = self.registry.find_attention_module(self.layers[layer_idx])
+        if attention_module is None:
+            raise ValueError(f"Could not find attention module in layer {layer_idx}")
+        return attention_module
     
     def get_attention_components(self, layer_idx: int) -> Dict[str, nn.Module]:
         """Get all attention components for a layer"""
@@ -521,6 +528,21 @@ class UniversalLayerHandler:
         
         return components
     
+    def get_mlp_module(self, layer_idx: int) -> nn.Module:
+        """Get the complete MLP module for a layer"""
+        mlp_info = self.get_mlp_architecture(layer_idx)
+        
+        if mlp_info.is_moe:
+            moe_module = self.registry.find_moe_module(self.layers[layer_idx])
+            if moe_module is None:
+                raise ValueError(f"Could not find MoE module in layer {layer_idx}")
+            return moe_module
+        else:
+            mlp_module = self.registry.find_mlp(self.layers[layer_idx])
+            if mlp_module is None:
+                raise ValueError(f"Could not find MLP module in layer {layer_idx}")
+            return mlp_module
+
     def get_mlp_components(self, layer_idx: int) -> Dict[str, nn.Module]:
         """Get all MLP components for a layer"""
         mlp_info = self.get_mlp_architecture(layer_idx)
@@ -548,12 +570,83 @@ class UniversalLayerHandler:
             components[comp_type] = getattr(layer, comp_name)
         
         return components
+
+    def get_layer_module(self, layer_idx: int) -> nn.Module:
+        """Get the complete layer module"""
+        if layer_idx >= len(self.layers):
+            raise ValueError(f"Layer index {layer_idx} out of range")
+        return self.layers[layer_idx]
     
+    def get_all_layer_modules(self, layer_idx: int) -> Dict[str, nn.Module]:
+        """Get all top-level modules of a layer organized by type"""
+        modules = {
+            'layer': self.get_layer_module(layer_idx),
+            'attention': self.get_attention_module(layer_idx),
+            'mlp': self.get_mlp_module(layer_idx),
+        }
+        
+        # Add normalization modules
+        norm_components = self.get_normalization_components(layer_idx)
+        for comp_type, module in norm_components.items():
+            modules[comp_type] = module
+        
+        return modules
+
+    def get_complete_layer_info(self, layer_idx: int) -> Dict[str, Dict[str, nn.Module]]:
+        """Get complete layer information with both top-level modules and subcomponents"""
+        return {
+            'modules': self.get_all_layer_modules(layer_idx),
+            'components': self.get_all_layer_components(layer_idx)
+        }
+
+    def get_attention_hierarchy(self, layer_idx: int) -> Dict[str, nn.Module]:
+        """Get complete attention hierarchy - both module and components"""
+        attention_module = self.get_attention_module(layer_idx)
+        attention_components = self.get_attention_components(layer_idx)
+        
+        return {
+            'module': attention_module,
+            'components': attention_components
+        }
+    
+    def get_mlp_hierarchy(self, layer_idx: int) -> Dict[str, nn.Module]:
+        """Get complete MLP hierarchy - both module and components"""
+        mlp_module = self.get_mlp_module(layer_idx)
+        mlp_info = self.get_mlp_architecture(layer_idx)
+        
+        hierarchy = {
+            'module': mlp_module,
+        }
+        
+        if mlp_info.is_moe:
+            hierarchy['experts'] = self.get_moe_experts(layer_idx)
+            # Add routing module if available
+            if mlp_info.moe_info and mlp_info.moe_info.routing_info.router_module:
+                hierarchy['router'] = mlp_info.moe_info.routing_info.router_module
+        else:
+            hierarchy['components'] = self.get_mlp_components(layer_idx)
+        
+        return hierarchy
+
+     # Enhanced version of get_all_layer_components to include modules
     def get_all_layer_components(self, layer_idx: int) -> Dict[str, Dict[str, nn.Module]]:
         """Get all components of a layer organized by type"""
+        try:
+            attention_hierarchy = self.get_attention_hierarchy(layer_idx)
+        except ValueError:
+            attention_hierarchy = {}
+
+        try:
+            if not self.get_mlp_architecture(layer_idx).is_moe:
+                mlp_hierarchy = self.get_mlp_hierarchy(layer_idx)
+            else:
+                mlp_hierarchy = {}
+        except ValueError:
+            mlp_hierarchy = {}
+
         return {
-            'attention': self.get_attention_components(layer_idx),
-            'mlp': self.get_mlp_components(layer_idx) if not self.get_mlp_architecture(layer_idx).is_moe else {},
+            'attention': attention_hierarchy,
+            'mlp': mlp_hierarchy,
             'normalization': self.get_normalization_components(layer_idx)
         }
     
@@ -587,6 +680,36 @@ class UniversalLayerHandler:
         moe_module = self.registry.find_moe_module(self.layers[layer_idx])
         experts = self.registry.find_experts(moe_module)
         return list(experts)
+
+    def get_layer_summary(self, layer_idx: int) -> Dict[str, Any]:
+        """Get a summary of layer structure"""
+        layer_info = self.get_layer_architecture(layer_idx)
+        
+        summary = {
+            'layer_idx': layer_idx,
+            'layer_class': self.get_layer_module(layer_idx).__class__.__name__,
+            'attention': {
+                'module_class': self.get_attention_module(layer_idx).__class__.__name__,
+                'architecture_type': layer_info.attention_info.architecture_type.value,
+                'num_heads': layer_info.attention_info.num_attention_heads,
+                'num_kv_heads': layer_info.attention_info.num_key_value_heads,
+                'components': list(layer_info.attention_info.components.keys())
+            },
+            'mlp': {
+                'module_class': self.get_mlp_module(layer_idx).__class__.__name__,
+                'architecture_type': layer_info.mlp_info.architecture_type.value,
+                'is_moe': layer_info.mlp_info.is_moe,
+                'activation': layer_info.mlp_info.activation_function,
+                'components': list(layer_info.mlp_info.components.keys()) if not layer_info.mlp_info.is_moe else []
+            },
+            'normalization': list(layer_info.normalization_components.keys())
+        }
+        
+        if layer_info.mlp_info.is_moe and layer_info.mlp_info.moe_info:
+            summary['mlp']['num_experts'] = layer_info.mlp_info.moe_info.num_experts
+            summary['mlp']['routing_type'] = layer_info.mlp_info.moe_info.routing_info.routing_type.value
+        
+        return summary
 
 
 # Convenience functions
