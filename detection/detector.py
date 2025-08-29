@@ -177,49 +177,60 @@ class SuperWeightDetector(BaseSuperWeightDetector):
     def _detect_single_iteration(self, input_tokens, spike_threshold: float, iteration: int):
         """Run detection for a single iteration"""
         # Storage for this iteration
-        max_input_values = []
-        max_input_indices = []
-        max_output_values = []
-        max_output_indices = []
+        max_input_values = [0.0] * self.num_layers
+        max_input_indices = [0] * self.num_layers
+        max_output_values = [0.0] * self.num_layers
+        max_output_indices = [0] * self.num_layers
+        weight_columns = [None] * self.num_layers
+        weight_values = [0.0] * self.num_layers
         hooks = []
-        
-        def create_hook(layer_idx: int, base: str, down_name: str):
-            def hook(module, inputs, output):
-                # Process input tensor
+
+        def create_pre_hook(layer_idx: int):
+            def pre_hook(module, inputs):
                 act_input = inputs[0].detach()
                 abs_input = torch.abs(act_input)
                 max_mag_input, max_idx_input = torch.max(abs_input.reshape(-1), dim=0)
                 actual_input_value = act_input.reshape(-1)[max_idx_input].item()
-                
-                # Process output tensor
+
+                if len(act_input.shape) == 3:
+                    h_input = max_idx_input.item() % act_input.shape[2]
+                    max_input_values[layer_idx] = actual_input_value
+                    max_input_indices[layer_idx] = h_input
+                    weight_columns[layer_idx] = module.weight[:, h_input].detach().cpu()
+
+            return pre_hook
+
+        def create_post_hook(layer_idx: int, base: str, down_name: str):
+            def hook(module, inputs, output):
                 act_output = output.detach()
                 abs_output = torch.abs(act_output)
                 max_mag_output, max_idx_output = torch.max(abs_output.reshape(-1), dim=0)
                 actual_output_value = act_output.reshape(-1)[max_idx_output].item()
-                
-                # Extract channel indices
-                if len(act_input.shape) == 3:  # [batch, seq, hidden]
-                    h_input = max_idx_input.item() % act_input.shape[2]
-                    max_input_values.append(actual_input_value)
-                    max_input_indices.append(h_input)
-                
-                if len(act_output.shape) == 3:  # [batch, seq, hidden]
+
+                h_output = None
+                if len(act_output.shape) == 3:
                     h_output = max_idx_output.item() % act_output.shape[2]
-                    max_output_values.append(actual_output_value)
-                    max_output_indices.append(h_output)
-                
-                self.logger.debug(f"Layer {layer_idx} {base}.{down_name} - "
-                                f"Input: {actual_input_value:.2f}@{h_input}, "
-                                f"Output: {actual_output_value:.2f}@{h_output}")
-            
+                    max_output_values[layer_idx] = actual_output_value
+                    max_output_indices[layer_idx] = h_output
+                    if weight_columns[layer_idx] is not None:
+                        weight_values[layer_idx] = weight_columns[layer_idx][h_output].item()
+
+                h_input = max_input_indices[layer_idx]
+                self.logger.debug(
+                    f"Layer {layer_idx} {base}.{down_name} - "
+                    f"Input: {max_input_values[layer_idx]:.2f}@{h_input}, "
+                    f"Output: {actual_output_value:.2f}@{h_output}"
+                )
+
             return hook
-        
+
         # Register hooks
         for layer_idx in range(self.num_layers):
             layer = self.layers[layer_idx]
             base, down_name, module = self._get_mlp_component_info(layer_idx)
-            hook = module.register_forward_hook(create_hook(layer_idx, base, down_name))
-            hooks.append(hook)
+            pre_hook = module.register_forward_pre_hook(create_pre_hook(layer_idx))
+            post_hook = module.register_forward_hook(create_post_hook(layer_idx, base, down_name))
+            hooks.extend([pre_hook, post_hook])
         
         # Run forward pass
         with torch.no_grad():
@@ -234,7 +245,8 @@ class SuperWeightDetector(BaseSuperWeightDetector):
             'max_input_values': max_input_values,
             'max_output_values': max_output_values,
             'max_input_indices': max_input_indices,
-            'max_output_indices': max_output_indices
+            'max_output_indices': max_output_indices,
+            'weight_values': weight_values,
         }
         
         self.iteration_data.append({
@@ -244,12 +256,11 @@ class SuperWeightDetector(BaseSuperWeightDetector):
         
         # Identify super weights
         super_weights = []
-        for i in range(len(max_output_values)):
+        for i in range(self.num_layers):
             if abs(max_output_values[i]) > spike_threshold and abs(max_input_values[i]) > spike_threshold:
-                layer = self.layers[i]
-                base, down_name, down_module = self._get_mlp_component_info(i)
-                original_value = down_module.weight.data[max_output_indices[i], max_input_indices[i]].item()
-                
+                base, down_name, _ = self._get_mlp_component_info(i)
+                original_value = weight_values[i]
+
                 super_weights.append(SuperWeight(
                     layer=i,
                     row=max_output_indices[i],
