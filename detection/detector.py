@@ -173,6 +173,26 @@ class SuperWeightDetector(BaseSuperWeightDetector):
         self._log_final_results(detected_super_weights)
         
         return detected_super_weights
+
+    def _safely_get_weight_column(self, module, h_input: int, device):
+        """Safely get weight column, handling device mapping"""
+        try:
+            if hasattr(module.weight, 'device') and module.weight.device.type == 'meta':
+                # Weight is on meta device, we can't access it
+                return None
+            
+            # Ensure weight is on the same device as the input
+            weight = module.weight
+            if weight.device != device:
+                # Move weight to target device temporarily
+                weight_column = weight[:, h_input].to(device).detach().cpu()
+            else:
+                weight_column = weight[:, h_input].detach().cpu()
+            
+            return weight_column
+        except Exception as e:
+            self.logger.warning(f"Could not access weight column: {e}")
+            return None
     
     def _detect_single_iteration(self, input_tokens, spike_threshold: float, iteration: int):
         """Run detection for a single iteration"""
@@ -196,7 +216,7 @@ class SuperWeightDetector(BaseSuperWeightDetector):
                     h_input = max_idx_input.item() % act_input.shape[2]
                     max_input_values[layer_idx] = actual_input_value
                     max_input_indices[layer_idx] = h_input
-                    weight_columns[layer_idx] = module.weight[:, h_input].detach().cpu()
+                    weight_columns[layer_idx] = self._safely_get_weight_column(module, h_input, device=self.device)
 
             return pre_hook
 
@@ -260,7 +280,6 @@ class SuperWeightDetector(BaseSuperWeightDetector):
             if abs(max_output_values[i]) > spike_threshold and abs(max_input_values[i]) > spike_threshold:
                 base, down_name, _ = self._get_mlp_component_info(i)
                 original_value = weight_values[i]
-
                 super_weights.append(SuperWeight(
                     layer=i,
                     row=max_output_indices[i],

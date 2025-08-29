@@ -74,8 +74,9 @@ cache/
 # HuggingFace cache
 ~/.cache/huggingface/
 
-# Results and outputs (optional - you may want to track some)
+# Results and outputs
 results/
+attack_evaluation_results/
 
 # Temporary files
 tmp/
@@ -86,6 +87,3 @@ temp/
 # Conda
 *.conda
 .condarc
-
-# Copilot things
-CLAUDE.md

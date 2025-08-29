@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 from typing import List, Literal, Dict, Optional
+import traceback
 import matplotlib.pyplot as plt
 import pandas as pd
 import os
@@ -75,6 +76,8 @@ class HeadAnalyzer:
 
             except Exception as e:
                 print(f"Skipping prompt due to error: {e}")
+                # print traceback
+                print(traceback.format_exc())
                 continue
         
         if prompts_processed == 0:
@@ -111,18 +114,29 @@ class HeadAnalyzer:
             return torch.zeros(attn_info.num_attention_heads, device=self.device)
 
         # Use values from attention architecture info
-        num_heads = attn_info.num_attention_heads
-        head_dim = attn_info.head_dim
-        queries = queries.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
-        keys = keys.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+        num_heads = attn_info.num_attention_heads  # 32
+        head_dim = attn_info.head_dim  # 128
+        num_key_value_heads = getattr(attn_info, 'num_key_value_heads', num_heads)  # 8
         
-        # k_0: Key of the first token
-        k0 = keys[:, :, 0, :]
-        # q_1: Query of the second token
-        q1 = queries[:, :, 1, :]
+        # Reshape queries: [batch, seq, num_heads * head_dim] -> [batch, seq, num_heads, head_dim]
+        queries = queries.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+        
+        # Reshape keys: [batch, seq, num_key_value_heads * head_dim] -> [batch, seq, num_key_value_heads, head_dim]
+        keys = keys.view(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2)
+        
+        # For GQA, we need to repeat keys to match the number of query heads
+        # Each key head serves num_heads // num_key_value_heads query heads
+        if num_key_value_heads != num_heads:
+            # Repeat keys to match query heads: [batch, num_key_value_heads, seq, head_dim] -> [batch, num_heads, seq, head_dim]
+            keys = keys.repeat_interleave(num_heads // num_key_value_heads, dim=1)
+        
+        # k_0: Key of the first token for all heads
+        k0 = keys[:, :, 0, :]  # [batch, num_heads, head_dim]
+        # q_1: Query of the second token for all heads
+        q1 = queries[:, :, 1, :]  # [batch, num_heads, head_dim]
         
         alignment = F.cosine_similarity(k0, q1, dim=-1)
-        return alignment.mean(dim=0) # Average over batch
+        return alignment.mean(dim=0)  # Average over batch
 
     @staticmethod
     def plot_head_scores(

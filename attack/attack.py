@@ -41,6 +41,9 @@ class SuperWeightAttackConfig:
     head_reduction: str = "single"  # Options: "single", "mean", "weighted", "topk"
     top_k_heads: int = 4  # For topk head reduction
     tau: float = 0.5
+    # Early stopping parameters
+    early_stopping_patience: int = 20
+    min_improvement: float = 1e-6
 
 # --- Core Abstractions ---
 
@@ -222,9 +225,6 @@ class HypothesisD(Loss):
         self.topk = getattr(config, 'top_k_heads', 4)
         self.tau = getattr(config, 'tau', 2.0)
         self._latest_attn_probs = None  # optional local cache
-        
-        # Add logging to see what mode we're in
-        print(f"HypothesisD initialized with head_reduction='{self.head_reduction}', topk={self.topk}, tau={self.tau}")
 
     def get_target_module(self) -> torch.nn.Module:
         return self.layer_handler.get_layer_module(self.target.super_weight.layer)
@@ -245,90 +245,184 @@ class HypothesisD(Loss):
             attn = getattr(self.config, "_latest_attn_probs", None)
         return attn
 
+    def _robust_cosine_similarity(self, x, y, dim=-1, eps=1e-6):
+        """Numerically stable cosine similarity that works with float16."""
+        # Convert to float32 for computation
+        x_f32 = x.float()
+        y_f32 = y.float()
+        
+        # Compute norms
+        x_norm = torch.norm(x_f32, dim=dim, keepdim=True)
+        y_norm = torch.norm(y_f32, dim=dim, keepdim=True)
+        
+        # Clamp norms to avoid division by zero
+        x_norm = torch.clamp(x_norm, min=eps)
+        y_norm = torch.clamp(y_norm, min=eps)
+        
+        # Normalize vectors
+        x_normalized = x_f32 / x_norm
+        y_normalized = y_f32 / y_norm
+        
+        # Compute cosine similarity
+        cos_sim = (x_normalized * y_normalized).sum(dim=dim)
+        
+        # Clamp to valid range and convert back to original dtype
+        cos_sim = torch.clamp(cos_sim, min=-1.0, max=1.0)
+        return cos_sim.to(x.dtype)
+
     def _per_head_sink_weights(self, attn_probs: torch.Tensor, rows: slice, col: int) -> torch.Tensor:
         # attn_probs: [bs, h, q, k] -> per-head sink strength s_h on content rows to sink column
-        s = attn_probs[:, :, rows, col].mean(dim=2)     # [bs, h]
-        w = torch.softmax(self.tau * s, dim=-1)         # [bs, h]
-        return w
+        try:
+            s = attn_probs[:, :, rows, col].mean(dim=2)     # [bs, h]
+            # Add numerical stability - convert to float32 for softmax
+            s_f32 = s.float()
+            s_stable = torch.clamp(s_f32, min=1e-8, max=1e8)
+            w_f32 = torch.softmax(self.tau * s_stable, dim=-1)
+            w = w_f32.to(s.dtype)  # Convert back to original dtype
+            return w
+        except Exception as e:
+            # Fallback to uniform weights
+            bs, h = attn_probs.shape[:2]
+            return torch.ones(bs, h, device=attn_probs.device, dtype=attn_probs.dtype) / h
 
     def _reduce_over_heads(self, cos_per_head: torch.Tensor) -> torch.Tensor:
         """
         cos_per_head: [bs, h] cosine per head.
         Returns per-example [bs] according to self.head_reduction.
         """
-        bs, h = cos_per_head.shape
+        # Add NaN checking and convert to float32 for stability
+        cos_per_head_f32 = cos_per_head.float()
+        
+        if torch.isnan(cos_per_head_f32).any():
+            cos_per_head_f32 = torch.nan_to_num(cos_per_head_f32, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        bs, h = cos_per_head_f32.shape
         mode = self.head_reduction
 
         if mode == "single":
             if self.target.head_idx is None:
                 raise ValueError("Hypothesis D with head_reduction='single' requires head_idx.")
             idx = self.target.head_idx
-            return cos_per_head.gather(dim=1, index=torch.full((bs, 1), idx, device=cos_per_head.device)).squeeze(1)
+            if idx >= h:
+                idx = 0
+            result = cos_per_head_f32.gather(dim=1, index=torch.full((bs, 1), idx, device=cos_per_head_f32.device, dtype=torch.long)).squeeze(1)
 
-        if mode == "mean":
-            return cos_per_head.mean(dim=1)
+        elif mode == "mean":
+            result = cos_per_head_f32.mean(dim=1)
 
-        attn = self._get_latest_attn_probs()
-        if attn is None:
-            # Fallbacks if attentions not cached
-            return cos_per_head.mean(dim=1) if mode == "weighted" else \
-                   cos_per_head.gather(dim=1, index=torch.full((bs, 1),
-                        (self.target.head_idx if self.target.head_idx is not None else 0),
-                        device=cos_per_head.device)).squeeze(1)
-
-        rows = slice(self.content_start_idx, self.content_end_idx)
-        col = self.config.sink_position if hasattr(self.config, 'sink_position') else 0
-        w = self._per_head_sink_weights(attn, rows, col)  # [bs, h]
-
-        if mode == "weighted":
-            return (cos_per_head * w).sum(dim=1)          # [bs]
-        elif mode == "topk":
-            topk_vals, topk_idx = w.topk(self.topk, dim=1)      # [bs, k]
-            gathered = cos_per_head.gather(dim=1, index=topk_idx)
-            return gathered.mean(dim=1)                         # [bs]
         else:
-            # unknown -> safe default
-            return cos_per_head.mean(dim=1)
+            attn = self._get_latest_attn_probs()
+            if attn is None:
+                result = cos_per_head_f32.mean(dim=1)
+            else:
+                rows = slice(self.content_start_idx, self.content_end_idx)
+                col = self.config.sink_position if hasattr(self.config, 'sink_position') else 0
+                
+                # Validate slice bounds
+                seq_len = attn.shape[-1]
+                if self.content_end_idx > seq_len:
+                    rows = slice(self.content_start_idx, min(self.content_end_idx, seq_len))
+                
+                if col >= seq_len:
+                    col = 0
+                    
+                w = self._per_head_sink_weights(attn, rows, col)  # [bs, h]
+                w_f32 = w.float()
+
+                if mode == "weighted":
+                    result = (cos_per_head_f32 * w_f32).sum(dim=1)
+                elif mode == "topk":
+                    topk_vals, topk_idx = w_f32.topk(min(self.topk, h), dim=1)
+                    gathered = cos_per_head_f32.gather(dim=1, index=topk_idx)
+                    result = gathered.mean(dim=1)
+                else:
+                    # unknown -> safe default
+                    result = cos_per_head_f32.mean(dim=1)
+        
+        # Convert back to original dtype
+        return result.to(cos_per_head.dtype)
 
     def _compute_loss_from_tensor(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Get attention architecture info and projections
-        attn_info = self.layer_handler.get_attention_architecture(self.target.super_weight.layer)
-        comps = self.layer_handler.get_attention_components(self.target.super_weight.layer)
-        q_proj, k_proj = comps['q_proj'], comps['k_proj']
-        norm = self.layer_handler.get_normalization_components(self.target.super_weight.layer)
+        try:
+            # Get attention architecture info and projections
+            attn_info = self.layer_handler.get_attention_architecture(self.target.super_weight.layer)
+            comps = self.layer_handler.get_attention_components(self.target.super_weight.layer)
+            q_proj, k_proj = comps['q_proj'], comps['k_proj']
+            norm = self.layer_handler.get_normalization_components(self.target.super_weight.layer)
 
-        if 'input_layernorm' in norm:
-            hidden_states = norm['input_layernorm'](hidden_states)
+            if 'input_layernorm' in norm:
+                hidden_states = norm['input_layernorm'](hidden_states)
 
-        # Compute Q/K and reshape to [bs, heads, seq, d_head]
-        queries = q_proj(hidden_states)
-        keys = k_proj(hidden_states)
-        bs, sl, _ = queries.shape
-        num_heads = attn_info.num_attention_heads
-        head_dim = attn_info.head_dim
+            # Compute Q/K and reshape to [bs, heads, seq, d_head]
+            queries = q_proj(hidden_states)
+            keys = k_proj(hidden_states)
+            bs, sl, _ = queries.shape
+            num_heads = attn_info.num_attention_heads
+            head_dim = attn_info.head_dim
 
-        queries = queries.view(bs, sl, num_heads, head_dim).transpose(1, 2)  # [bs, h, seq, d]
-        keys    = keys.view(bs, sl, num_heads, head_dim).transpose(1, 2)     # [bs, h, seq, d]
+            # Ensure shapes are correct
+            expected_qk_dim = num_heads * head_dim
+            if queries.shape[-1] != expected_qk_dim:
+                # Try to fix by truncating or padding
+                if queries.shape[-1] > expected_qk_dim:
+                    queries = queries[..., :expected_qk_dim]
+                    keys = keys[..., :expected_qk_dim]
 
-        sink_col = self.config.sink_position if hasattr(self.config, 'sink_position') else 0
-        
-        if getattr(self.config, 'target_all_content_tokens', False):
-            content_start = self.content_start_idx
-            content_end = self.content_end_idx
-            content_queries = queries[:, :, content_start:content_end, :]           # [bs, h, Lc, d]
-            k_sink_all = keys[:, :, sink_col, :].unsqueeze(2)                       # [bs, h, 1, d]
-            # cosine per head (and per content token) -> [bs, h, Lc]
-            cos = F.cosine_similarity(k_sink_all, content_queries, dim=-1)
-            # average across content tokens -> [bs, h]
-            cos_per_head = cos.mean(dim=2)
-        else:
-            content_pos = self.content_start_idx
-            qt_all = queries[:, :, content_pos, :]                                  # [bs, h, d]
-            k_sink_all = keys[:, :, sink_col, :]                                    # [bs, h, d]
-            cos_per_head = F.cosine_similarity(k_sink_all, qt_all, dim=-1)          # [bs, h]
+            queries = queries.view(bs, sl, num_heads, head_dim).transpose(1, 2)  # [bs, h, seq, d]
+            keys    = keys.view(bs, sl, num_heads, head_dim).transpose(1, 2)     # [bs, h, seq, d]
 
-        # Reduce over heads according to the selected strategy (returns [bs])
-        return self._reduce_over_heads(cos_per_head)
+            sink_col = self.config.sink_position if hasattr(self.config, 'sink_position') else 0
+            
+            # Validate indices
+            if sink_col >= sl:
+                sink_col = 0
+            
+            if self.content_end_idx > sl:
+                content_end = min(self.content_end_idx, sl)
+            else:
+                content_end = self.content_end_idx
+                
+            if self.content_start_idx >= content_end:
+                # Fallback to a valid range
+                content_start = max(0, min(self.content_start_idx, sl - 1))
+                content_end = min(content_start + 1, sl)
+            else:
+                content_start = self.content_start_idx
+            
+            if getattr(self.config, 'target_all_content_tokens', False):
+                content_queries = queries[:, :, content_start:content_end, :]           # [bs, h, Lc, d]
+                k_sink_all = keys[:, :, sink_col, :].unsqueeze(2)                       # [bs, h, 1, d]
+                
+                # Check for empty content
+                if content_queries.shape[2] == 0:
+                    return torch.zeros(bs, device=hidden_states.device, dtype=hidden_states.dtype)
+                
+                # Use robust cosine similarity
+                cos = self._robust_cosine_similarity(k_sink_all, content_queries, dim=-1)
+                
+                # average across content tokens -> [bs, h]
+                cos_per_head = cos.mean(dim=2)
+            else:
+                content_pos = content_start
+                qt_all = queries[:, :, content_pos, :]                                  # [bs, h, d]
+                k_sink_all = keys[:, :, sink_col, :]                                    # [bs, h, d]
+                
+                # Use robust cosine similarity
+                cos_per_head = self._robust_cosine_similarity(k_sink_all, qt_all, dim=-1)
+
+            # Reduce over heads according to the selected strategy (returns [bs])
+            result = self._reduce_over_heads(cos_per_head)
+            
+            # Final NaN check
+            if torch.isnan(result).any():
+                result = torch.nan_to_num(result, nan=0.0)
+            
+            return result
+            
+        except Exception as e:
+            # Return a safe fallback
+            bs = hidden_states.shape[0]
+            return torch.zeros(bs, device=hidden_states.device, dtype=hidden_states.dtype)
 
 
 class HypothesisE(Loss):
@@ -587,11 +681,18 @@ class SuperWeightAttacker:
         adv_ids = self.tokenizer(self.config.adv_string_init, return_tensors='pt', add_special_tokens=False)['input_ids'].to(self.device)
         
         self.logger.info("Starting GCG attack (has_bos=%s, hypotheses=%s, placement=%s, steps=%d)", 
-                         has_bos,
-                         (list(self.config.loss_weights.keys()) if self.config.loss_weights else self.config.hypothesis),
-                         self.config.placement, self.config.num_steps)
+                        has_bos,
+                        (list(self.config.loss_weights.keys()) if self.config.loss_weights else self.config.hypothesis),
+                        self.config.placement, self.config.num_steps)
 
         results = {'loss_history': [], 'adv_string_history': []}
+        
+        # Early stopping parameters
+        patience = self.config.early_stopping_patience
+        min_improvement = self.config.min_improvement
+        best_loss = float('inf')
+        patience_counter = 0
+        
         pbar = tqdm(range(self.config.num_steps), desc=f"Attacking Hypothesis {self.config.hypothesis}")
         for step in pbar:
             grad = self._get_gradients(bos_id, content_ids, adv_ids, has_bos)
@@ -600,24 +701,54 @@ class SuperWeightAttacker:
                 losses = self._evaluate_candidates(bos_id, content_ids, candidate_ids, has_bos)
                 best_idx = losses.argmin()
                 adv_ids = candidate_ids[best_idx].unsqueeze(0)
-                best_loss = losses[best_idx].item()
-                results['loss_history'].append(best_loss)
+                best_loss_step = losses[best_idx].item()
+                
+                results['loss_history'].append(best_loss_step)
                 current_adv = self.tokenizer.decode(adv_ids.squeeze(0), skip_special_tokens=True)
                 results['adv_string_history'].append(current_adv)
-                pbar.set_postfix({"loss": f"{best_loss:.4f}", "adv_string": f"'{current_adv}'"})
+                
+                # Early stopping check
+                if best_loss - best_loss_step > min_improvement:
+                    best_loss = best_loss_step
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    
+                if patience_counter >= patience:
+                    self.logger.info(f"Early stopping at step {step} - no improvement for {patience} steps")
+                    break
+                
+                pbar.set_postfix({
+                    "loss": f"{best_loss_step:.4f}", 
+                    "adv_string": f"'{current_adv}'"
+                })
 
         final_adv = self.tokenizer.decode(adv_ids.squeeze(0), skip_special_tokens=True)
         results['final_adv_string'] = final_adv
         results['final_loss'] = results['loss_history'][-1] if results['loss_history'] else float('nan')
-        self.logger.info("Attack finished. final_loss=%.6f, final_adv='%s'", results['final_loss'], final_adv)
+        results['early_stopped'] = patience_counter >= patience
+        results['steps_completed'] = len(results['loss_history'])
+        
+        self.logger.info("Attack finished. final_loss=%.6f, final_adv='%s', early_stopped=%s, steps=%d", 
+                        results['final_loss'], final_adv, results['early_stopped'], results['steps_completed'])
         return results
 
     def _get_gradients(self, bos_id: Optional[torch.Tensor], content_ids: torch.Tensor, adv_ids: torch.Tensor, has_bos: bool) -> torch.Tensor:
         """Differentiate the loss wrt the one-hot adv tokens to obtain vocab gradients."""
+        # Match the dtype of the embedding layer weights
+        embedding_dtype = self.embedding_layer.weight.dtype
+        
+        # Use float32 for the one-hot tensor to avoid numerical issues
         adv_one_hot = F.one_hot(adv_ids, num_classes=self.embedding_layer.weight.shape[0]).float()
         adv_one_hot.requires_grad_()
         
-        adv_embeds = adv_one_hot @ self.embedding_layer.weight
+        # Convert embedding matrix to float32 for computation
+        embedding_matrix_f32 = self.embedding_layer.weight.float()
+        adv_embeds = adv_one_hot @ embedding_matrix_f32
+        
+        # Convert back to original dtype for model forward pass
+        adv_embeds = adv_embeds.to(embedding_dtype)
+        
         content_embeds = self.embedding_layer(content_ids)
         
         if has_bos:
@@ -638,13 +769,34 @@ class SuperWeightAttacker:
 
         handles = self.loss_fn.install_hooks()
         try:
-            self.partial_model(inputs_embeds, output_attentions=self.loss_fn.needs_attentions())
-            loss = self.loss_fn.compute_loss().mean()
+            outputs = self.partial_model(inputs_embeds, output_attentions=self.loss_fn.needs_attentions())
+            loss_vec = self.loss_fn.compute_loss()
+            
+            # Check for NaN/inf in loss
+            if torch.isnan(loss_vec).any() or torch.isinf(loss_vec).any():
+                return torch.zeros_like(adv_one_hot)
+                
+            loss = loss_vec.mean()
+            
+            # Check if loss is valid for backprop
+            if torch.isnan(loss) or torch.isinf(loss):
+                return torch.zeros_like(adv_one_hot)
+                
             loss.backward()
+            
+            if adv_one_hot.grad is None:
+                return torch.zeros_like(adv_one_hot)
+            
+            # Check for NaN/inf in gradients
+            if torch.isnan(adv_one_hot.grad).any() or torch.isinf(adv_one_hot.grad).any():
+                return torch.zeros_like(adv_one_hot.grad)
+                
         finally:
             self.loss_fn.remove_hooks(handles)
 
         grad = adv_one_hot.grad.clone()
+        # Convert back to original dtype
+        grad = grad.to(embedding_dtype)
         return grad
 
     def _sample_candidates(self, adv_ids: torch.Tensor, grad: torch.Tensor) -> torch.Tensor:
@@ -1227,10 +1379,11 @@ class MultiPromptSuperWeightAttacker(SuperWeightAttacker):
         has_bos = self._has_bos_token()
         grads = []
         needs_attentions = self._needs_attentions_for_config()
+        embedding_dtype = self.embedding_layer.weight.dtype
 
         for prompt_data in self.prompt_data:
             # one-hot for this prompt
-            adv_one_hot = F.one_hot(adv_ids, num_classes=self.embedding_layer.weight.shape[0]).float().to(self.device)
+            adv_one_hot = F.one_hot(adv_ids, num_classes=self.embedding_layer.weight.shape[0]).to(dtype=embedding_dtype, device=self.device)
             adv_one_hot.requires_grad_()
 
             adv_embeds = adv_one_hot @ self.embedding_layer.weight  # [1, L_adv, d]

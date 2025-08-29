@@ -64,10 +64,17 @@ def set_all_seeds(seed: int = 42):
 def setup_logging(output_dir: Path, model_name: str) -> logging.Logger:
     """Setup logging configuration."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = output_dir / f"attack_evaluation_{model_name.replace('/', '_')}_{timestamp}.log"
+    safe_model_name = model_name.replace('/', '_')
+    
+    # Create model-specific directory and logs subdirectory
+    model_dir = output_dir / safe_model_name
+    logs_dir = model_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    
+    log_file = logs_dir / f"attack_evaluation_{timestamp}.log"
     
     # Create logger
-    logger = logging.getLogger("AttackEvaluation")
+    logger = logging.getLogger(f"AttackEvaluation_{safe_model_name}")
     logger.setLevel(logging.INFO)
     
     # Clear existing handlers
@@ -207,7 +214,7 @@ def run_attack_for_super_weight(session, super_weight, hypothesis: str, logger: 
         attack_result = attacker.attack()
         
         logger.info(f"Attack completed. Final loss: {attack_result['final_loss']:.6f}")
-        logger.info(f"Best adversarial string: '{attack_result['best_adv_string']}'")
+        logger.info(f"Best adversarial string: '{attack_result['final_adv_string']}'")
         
         return {
             'super_weight': super_weight,
@@ -238,7 +245,7 @@ def validate_attack_consistency(session, attack_result: Dict[str, Any], logger: 
         consistency_result = run_multi_seed_consistency_evaluation(
             session=session,
             attacker=attack_result['attacker'],
-            adv_string=attack_result['attack_result']['best_adv_string'],
+            adv_string=attack_result['attack_result']['final_adv_string'],
             seeds=seeds,
             n_prompts=n_prompts,
             min_tokens=min_tokens,
@@ -255,7 +262,7 @@ def validate_attack_consistency(session, attack_result: Dict[str, Any], logger: 
         )
         
         # Check if attack passes consistency tests
-        overall_pass = consistency_result.get('final_evaluation', {}).get('overall_pass', False)
+        overall_pass = consistency_result.get('final_evaluation', {}).get('pass_fail', False)
         logger.info(f"Attack consistency: {'PASS' if overall_pass else 'FAIL'}")
         
         return consistency_result
@@ -267,7 +274,7 @@ def validate_attack_consistency(session, attack_result: Dict[str, Any], logger: 
 
 
 def run_perplexity_evaluation(session, attack_result: Dict[str, Any], logger: logging.Logger,
-                             output_dir: Path, bakeoff_config: dict = None) -> Dict[str, Any]:
+                             model_dir: Path, bakeoff_config: dict = None) -> Dict[str, Any]:
     """Run perplexity bake-off evaluation."""
     logger.info(f"Running perplexity bake-off for {attack_result['super_weight']} (Hypothesis {attack_result['hypothesis']})")
     
@@ -282,7 +289,7 @@ def run_perplexity_evaluation(session, attack_result: Dict[str, Any], logger: lo
             session=session,
             attacker=attack_result['attacker'],
             target_sw=attack_result['super_weight'],
-            adv_prefix=attack_result['attack_result']['best_adv_string'],
+            adv_prefix=attack_result['attack_result']['final_adv_string'],
             prompts=None,  # Will sample automatically
             seed=42,
             activation_metric='down_proj_in_col_at_sink',
@@ -296,10 +303,9 @@ def run_perplexity_evaluation(session, attack_result: Dict[str, Any], logger: lo
             max_tokens=max_tokens
         )
         
-        # Plot and save results
+        # Plot and save results in model-specific plots directory
         plot_filename = f"perplexity_bakeoff_{attack_result['super_weight'].layer}_{attack_result['super_weight'].row}_{attack_result['super_weight'].column}_{attack_result['hypothesis']}.png"
-        plot_path = output_dir / "plots" / plot_filename
-        plot_path.parent.mkdir(exist_ok=True)
+        plot_path = model_dir / "plots" / plot_filename
         
         plot_perplexity_bakeoff(bakeoff_result, figsize=(12, 8), save_path=str(plot_path))
         logger.info(f"Perplexity bake-off plot saved: {plot_path}")
@@ -313,13 +319,22 @@ def run_perplexity_evaluation(session, attack_result: Dict[str, Any], logger: lo
 
 
 def save_results(results: Dict[str, Any], output_dir: Path, model_name: str):
-    """Save all results to JSON and CSV files."""
+    """Save all results to JSON and CSV files in model-specific directory."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_model_name = model_name.replace('/', '_')
     
+    # Create model-specific directory
+    model_dir = output_dir / safe_model_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create subdirectories
+    (model_dir / "plots").mkdir(exist_ok=True)
+    (model_dir / "data").mkdir(exist_ok=True)
+    (model_dir / "logs").mkdir(exist_ok=True)
+    
     # Save comprehensive JSON results
-    json_filename = f"attack_evaluation_results_{safe_model_name}_{timestamp}.json"
-    json_path = output_dir / json_filename
+    json_filename = f"attack_evaluation_results_{timestamp}.json"
+    json_path = model_dir / "data" / json_filename
     
     # Prepare JSON-serializable results
     json_results = {}
@@ -342,7 +357,7 @@ def save_results(results: Dict[str, Any], output_dir: Path, model_name: str):
                         'super_weight': str(result.get('super_weight')),
                         'hypothesis': result.get('hypothesis'),
                         'attack_result': {
-                            'best_adv_string': result.get('attack_result', {}).get('best_adv_string'),
+                            'final_adv_string': result.get('attack_result', {}).get('final_adv_string'),
                             'final_loss': result.get('attack_result', {}).get('final_loss'),
                             'total_iterations': result.get('attack_result', {}).get('total_iterations'),
                             'final_metrics': result.get('attack_result', {}).get('final_metrics')
@@ -369,7 +384,7 @@ def save_results(results: Dict[str, Any], output_dir: Path, model_name: str):
                     'row': result.get('super_weight').row,
                     'column': result.get('super_weight').column,
                     'hypothesis': hypothesis,
-                    'adv_string': result.get('attack_result', {}).get('best_adv_string'),
+                    'adv_string': result.get('attack_result', {}).get('final_adv_string'),
                     'final_loss': result.get('attack_result', {}).get('final_loss'),
                     'total_iterations': result.get('attack_result', {}).get('total_iterations'),
                     'consistency_pass': result.get('consistency_result', {}).get('final_evaluation', {}).get('overall_pass', False)
@@ -456,17 +471,28 @@ def save_results(results: Dict[str, Any], output_dir: Path, model_name: str):
                 csv_data.append(row)
     
     if csv_data:
-        csv_filename = f"attack_evaluation_summary_{safe_model_name}_{timestamp}.csv"
-        csv_path = output_dir / csv_filename
+        csv_filename = f"attack_evaluation_summary_{timestamp}.csv"
+        csv_path = model_dir / "data" / csv_filename
         pd.DataFrame(csv_data).to_csv(csv_path, index=False)
-        print(f"Results saved:")
+        print(f"Results saved for {model_name}:")
         print(f"  JSON: {json_path}")
         print(f"  CSV: {csv_path}")
+        print(f"  Model directory: {model_dir}")
+    
+    return model_dir
 
 
 def process_model(model_name: str, output_dir: Path, logger: logging.Logger, args) -> Dict[str, Any]:
     """Process a single model: detect super weights, run attacks, and evaluate."""
     logger.info(f"Processing model: {model_name}")
+    
+    # Create model-specific directory early
+    safe_model_name = model_name.replace('/', '_')
+    model_dir = output_dir / safe_model_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "plots").mkdir(exist_ok=True)
+    (model_dir / "data").mkdir(exist_ok=True)
+    (model_dir / "logs").mkdir(exist_ok=True)
     
     results = {
         'model_info': {
@@ -491,9 +517,7 @@ def process_model(model_name: str, output_dir: Path, logger: logging.Logger, arg
     try:
         session = SuperWeightResearchSession.from_model_name(
             model_name, 
-            cache_dir=args.cache_dir,
-            device_map="auto" if args.device_map_auto else None,
-            torch_dtype=torch.float16 if args.use_fp16 else None
+            cache_dir=args.cache_dir
         )
         session.model.eval()
         logger.info(f"Model loaded successfully: {model_name}")
@@ -602,7 +626,7 @@ def process_model(model_name: str, output_dir: Path, logger: logging.Logger, arg
                 # Run perplexity bake-off if requested
                 if not args.skip_bakeoff:
                     hypothesis_result['bakeoff_result'] = run_perplexity_evaluation(
-                        session, hypothesis_result, logger, output_dir, bakeoff_config
+                        session, hypothesis_result, logger, model_dir, bakeoff_config
                     )
                 
             results['attack_results'][sw_key][hypothesis] = hypothesis_result
@@ -611,6 +635,12 @@ def process_model(model_name: str, output_dir: Path, logger: logging.Logger, arg
     save_results(results, output_dir, model_name)
     
     logger.info(f"Model processing completed: {model_name}")
+    # Also clean up the session object explicitly
+    try:
+        del session
+    except:
+        pass
+
     return results
 
 
@@ -629,12 +659,6 @@ def main():
                        help='Random seed for reproducibility')
     parser.add_argument('--cache_dir', type=str, default='~/models/',
                        help='Directory to cache downloaded models')
-    
-    # Model loading options
-    parser.add_argument('--device_map_auto', action='store_true',
-                       help='Use automatic device mapping for multi-GPU (recommended for 2x GPUs)')
-    parser.add_argument('--use_fp16', action='store_true',
-                       help='Use float16 precision to save VRAM')
     
     # Super weight detection
     parser.add_argument('--spike_threshold', type=float, default=50.0,
@@ -657,7 +681,7 @@ def main():
                        help='Head reduction method for Hypothesis D')
     parser.add_argument('--attack_num_steps', type=int, default=200,
                        help='Number of attack optimization steps')
-    parser.add_argument('--adv_string_init', type=str, default="! ! ! ! ! ! ! ! ! !",
+    parser.add_argument('--adv_string_init', type=str, default="<bos> ~ <bos> ~ <bos>",
                        help='Initial adversarial string')
     parser.add_argument('--attack_search_width', type=int, default=512,
                        help='Attack search width')
@@ -717,8 +741,6 @@ def main():
         
         # Set memory management for better multi-GPU performance
         torch.cuda.empty_cache()
-        if args.device_map_auto:
-            print("Using automatic device mapping for multi-GPU")
     else:
         print("CUDA not available, using CPU")
     
@@ -731,7 +753,6 @@ def main():
     print(f"Head reduction: {args.head_reduction}")
     print(f"Skip consistency: {args.skip_consistency}")
     print(f"Skip bakeoff: {args.skip_bakeoff}")
-    print(f"Use FP16: {args.use_fp16}")
     print(f"Random seed: {args.seed}")
     print("-" * 50)
     

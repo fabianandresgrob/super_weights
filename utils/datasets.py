@@ -32,27 +32,26 @@ class DatasetLoader:
         Returns:
             List of text strings
         """
-        
-        dataset = load_dataset(dataset_name, config, split=split, streaming=True)
-        texts = []
-        
-        for i, example in enumerate(dataset):
-            if i >= n_samples * 3:  # Load extra to account for filtering
-                break
+        try:
+            # Use non-streaming mode to avoid multiprocessing issues
+            dataset = load_dataset(dataset_name, config, split=split, streaming=False)
             
-            text = example['text'].strip()
-            if len(text) >= min_length:
-                texts.append(text)
+            # Convert to list and filter
+            all_texts = [example['text'].strip() for example in dataset if len(example['text'].strip()) >= min_length]
             
-            if len(texts) >= n_samples:
-                break
-        
-        # If we don't have enough, repeat shorter texts
-        if len(texts) < n_samples:
-            while len(texts) < n_samples:
-                texts.extend(texts[:min(len(texts), n_samples - len(texts))])
-        
-        return texts[:n_samples]
+            # If we have enough texts, randomly sample
+            if len(all_texts) >= n_samples:
+                random.shuffle(all_texts)
+                return all_texts[:n_samples]
+            else:
+                # If not enough, repeat what we have
+                texts = all_texts[:]
+                while len(texts) < n_samples:
+                    texts.extend(all_texts[:min(len(all_texts), n_samples - len(texts))])
+                return texts[:n_samples]
+                
+        except Exception as e:
+            print(f"Failed to load {dataset_name}: {e}")
     
     def load_hellaswag(self, split: str = 'validation', n_samples: int = 100) -> List[Dict[str, Any]]:
         """
