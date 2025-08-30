@@ -4,6 +4,7 @@ import numpy as np
 import logging
 from typing import Dict, List, Tuple, Optional, Any, Literal
 from tqdm.auto import tqdm
+import traceback
 from dataclasses import dataclass
 
 from detection.super_weight import SuperWeight
@@ -315,6 +316,9 @@ class HypothesisD(Loss):
             if attn is None:
                 result = cos_per_head_f32.mean(dim=1)
             else:
+                # Get attention constraints using layer_handler
+                constraints = self.layer_handler.get_attention_constraints(self.target.super_weight.layer)
+                
                 rows = slice(self.content_start_idx, self.content_end_idx)
                 col = self.config.sink_position if hasattr(self.config, 'sink_position') else 0
                 
@@ -325,21 +329,44 @@ class HypothesisD(Loss):
                 
                 if col >= seq_len:
                     col = 0
+                
+                # Apply sliding window constraints if present
+                if constraints['has_constraints'] and constraints['type'] == 'sliding_window':
+                    window_size = constraints['window_size']
+                    # Only consider content tokens within window of sink
+                    effective_start = max(self.content_start_idx, max(0, col - window_size))
+                    effective_end = min(self.content_end_idx, col + window_size + 1)
                     
-                w = self._per_head_sink_weights(attn, rows, col)  # [bs, h]
-                w_f32 = w.float()
+                    if effective_start >= effective_end:
+                        # No content tokens can attend to sink
+                        result = torch.zeros(bs, device=cos_per_head_f32.device, dtype=cos_per_head_f32.dtype)
+                    else:
+                        rows = slice(effective_start, effective_end)
+                        w = self._per_head_sink_weights(attn, rows, col)  # [bs, h]
+                        w_f32 = w.float()
 
-                if mode == "weighted":
-                    result = (cos_per_head_f32 * w_f32).sum(dim=1)
-                elif mode == "topk":
-                    topk_vals, topk_idx = w_f32.topk(min(self.topk, h), dim=1)
-                    gathered = cos_per_head_f32.gather(dim=1, index=topk_idx)
-                    result = gathered.mean(dim=1)
+                        if mode == "weighted":
+                            result = (cos_per_head_f32 * w_f32).sum(dim=1)
+                        elif mode == "topk":
+                            topk_vals, topk_idx = w_f32.topk(min(self.topk, h), dim=1)
+                            gathered = cos_per_head_f32.gather(dim=1, index=topk_idx)
+                            result = gathered.mean(dim=1)
+                        else:
+                            result = cos_per_head_f32.mean(dim=1)
                 else:
-                    # unknown -> safe default
-                    result = cos_per_head_f32.mean(dim=1)
-        
-        # Convert back to original dtype
+                    # Original logic for full attention
+                    w = self._per_head_sink_weights(attn, rows, col)  # [bs, h]
+                    w_f32 = w.float()
+
+                    if mode == "weighted":
+                        result = (cos_per_head_f32 * w_f32).sum(dim=1)
+                    elif mode == "topk":
+                        topk_vals, topk_idx = w_f32.topk(min(self.topk, h), dim=1)
+                        gathered = cos_per_head_f32.gather(dim=1, index=topk_idx)
+                        result = gathered.mean(dim=1)
+                    else:
+                        result = cos_per_head_f32.mean(dim=1)
+    
         return result.to(cos_per_head.dtype)
 
     def _compute_loss_from_tensor(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -353,23 +380,27 @@ class HypothesisD(Loss):
             if 'input_layernorm' in norm:
                 hidden_states = norm['input_layernorm'](hidden_states)
 
-            # Compute Q/K and reshape to [bs, heads, seq, d_head]
+            # Compute Q/K projections
             queries = q_proj(hidden_states)
             keys = k_proj(hidden_states)
             bs, sl, _ = queries.shape
-            num_heads = attn_info.num_attention_heads
+            
+            # Handle GQA: Get actual head counts
+            num_query_heads = attn_info.num_attention_heads
+            num_key_heads = getattr(attn_info, 'num_key_value_heads', num_query_heads)
             head_dim = attn_info.head_dim
-
-            # Ensure shapes are correct
-            expected_qk_dim = num_heads * head_dim
-            if queries.shape[-1] != expected_qk_dim:
-                # Try to fix by truncating or padding
-                if queries.shape[-1] > expected_qk_dim:
-                    queries = queries[..., :expected_qk_dim]
-                    keys = keys[..., :expected_qk_dim]
-
-            queries = queries.view(bs, sl, num_heads, head_dim).transpose(1, 2)  # [bs, h, seq, d]
-            keys    = keys.view(bs, sl, num_heads, head_dim).transpose(1, 2)     # [bs, h, seq, d]
+            
+            # Reshape Q and K with their actual dimensions
+            queries = queries.view(bs, sl, num_query_heads, head_dim).transpose(1, 2)  # [bs, q_heads, seq, d]
+            keys = keys.view(bs, sl, num_key_heads, head_dim).transpose(1, 2)          # [bs, k_heads, seq, d]
+            
+            # For GQA: Expand keys to match query heads by repeating
+            if num_key_heads != num_query_heads:
+                if num_query_heads % num_key_heads != 0:
+                    raise ValueError(f"Query heads ({num_query_heads}) must be divisible by key heads ({num_key_heads})")
+                
+                repeat_factor = num_query_heads // num_key_heads
+                keys = keys.repeat_interleave(repeat_factor, dim=1)  # [bs, q_heads, seq, d]
 
             sink_col = self.config.sink_position if hasattr(self.config, 'sink_position') else 0
             
@@ -389,10 +420,25 @@ class HypothesisD(Loss):
             else:
                 content_start = self.content_start_idx
             
+            # Get sliding window constraints
+            constraints = self.layer_handler.get_attention_constraints(self.target.super_weight.layer)
+            
             if getattr(self.config, 'target_all_content_tokens', False):
-                content_queries = queries[:, :, content_start:content_end, :]           # [bs, h, Lc, d]
-                k_sink_all = keys[:, :, sink_col, :].unsqueeze(2)                       # [bs, h, 1, d]
+                # Apply sliding window filtering to content tokens
+                if constraints['has_constraints'] and constraints['type'] == 'sliding_window':
+                    window_size = constraints['window_size']
+                    effective_start = max(content_start, max(0, sink_col - window_size))
+                    effective_end = min(content_end, sink_col + window_size + 1)
+                    
+                    if effective_start >= effective_end:
+                        return torch.zeros(bs, device=hidden_states.device, dtype=hidden_states.dtype)
+                    
+                    # Use only content tokens within sliding window
+                    content_queries = queries[:, :, effective_start:effective_end, :]
+                else:
+                    content_queries = queries[:, :, content_start:content_end, :]
                 
+                k_sink_all = keys[:, :, sink_col, :].unsqueeze(2)
                 # Check for empty content
                 if content_queries.shape[2] == 0:
                     return torch.zeros(bs, device=hidden_states.device, dtype=hidden_states.dtype)
@@ -403,6 +449,12 @@ class HypothesisD(Loss):
                 # average across content tokens -> [bs, h]
                 cos_per_head = cos.mean(dim=2)
             else:
+                # Single token case - check if it can attend to sink
+                if constraints['has_constraints'] and constraints['type'] == 'sliding_window':
+                    distance = abs(content_start - sink_col)
+                    if distance > constraints['window_size']:
+                        return torch.zeros(bs, device=hidden_states.device, dtype=hidden_states.dtype)
+                
                 content_pos = content_start
                 qt_all = queries[:, :, content_pos, :]                                  # [bs, h, d]
                 k_sink_all = keys[:, :, sink_col, :]                                    # [bs, h, d]
@@ -446,8 +498,26 @@ class HypothesisE(Loss):
     def _compute_loss_from_tensor(self, attn_probs: torch.Tensor) -> torch.Tensor:
         col = self.config.sink_position  # Use sink position
         rows = slice(self.content_start_idx, self.content_end_idx)
-        # mean over heads and content rows toward sink col
-        return attn_probs[:, :, rows, col].mean(dim=(1, 2))  # [bs]
+        
+        # Get attention constraints using layer_handler
+        constraints = self.layer_handler.get_attention_constraints(self.target.super_weight.layer)
+        
+        if constraints['has_constraints'] and constraints['type'] == 'sliding_window':
+            window_size = constraints['window_size']
+            
+            # Only consider content tokens that can actually attend to sink
+            effective_start = max(self.content_start_idx, max(0, col - window_size))
+            effective_end = min(self.content_end_idx, col + window_size + 1)
+            
+            if effective_start >= effective_end:
+                # No content tokens can attend to sink
+                return torch.zeros(attn_probs.shape[0], device=attn_probs.device, dtype=attn_probs.dtype)
+            
+            effective_rows = slice(effective_start, effective_end)
+            return attn_probs[:, :, effective_rows, col].mean(dim=(1, 2))
+        else:
+            # Original logic for full attention
+            return attn_probs[:, :, rows, col].mean(dim=(1, 2))  # [bs]
 
 # --- Composite Loss ---
 
@@ -1139,6 +1209,8 @@ class SuperWeightAttacker:
             'stopword_mass_content_mean': stopword_mass_content_mean
         }
 
+        constraints = self.layer_handler.get_attention_constraints(self.config.target.super_weight.layer)
+
         return {
             # attention to sink (head-specific + aggregate)
             'content_attn_to_sink_head': content_attn_to_sink_head,
@@ -1161,7 +1233,8 @@ class SuperWeightAttacker:
                 'prompt_len': eval_prompt_len,
                 'placement': self.config.placement,
                 'sink_pos': sink_pos,
-                'has_bos': has_bos
+                'has_bos': has_bos,
+                'attention_constraints': constraints
             }
         }
 

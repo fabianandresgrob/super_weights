@@ -310,7 +310,7 @@ class UniversalLayerHandler:
                 # Detect attention architecture
                 attention_module = self.registry.find_attention_module(layer)
                 if attention_module is not None:
-                    attention_info = self._detect_attention_architecture(attention_module)
+                    attention_info = self._detect_attention_architecture(attention_module, layer_idx)
                 else:
                     attention_info = self._create_unknown_attention_architecture()
                 
@@ -344,29 +344,74 @@ class UniversalLayerHandler:
         
         return architectures
     
-    def _detect_attention_architecture(self, attention_module: nn.Module) -> AttentionArchitectureInfo:
+    def _detect_attention_architecture(self, attention_module: nn.Module, layer_idx: int) -> AttentionArchitectureInfo:
         """Detect attention architecture and components"""
         components = {}
         
-        # Extract attention components
-        for comp_type in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
-            comp_name = self.registry.get_attention_component_name(attention_module, comp_type)
-            if comp_name:
-                module = getattr(attention_module, comp_name)
-                
-                # Handle fused QKV projections
-                if comp_name == 'c_attn' and comp_type in ['q_proj', 'k_proj', 'v_proj']:
-                    # For fused QKV, we need to handle this specially
-                    weight_shape = tuple(module.weight.shape)
-                else:
-                    weight_shape = tuple(module.weight.shape)
+        # Get architecture parameters first
+        num_heads = self.registry.get_attention_config_value(attention_module, 'num_heads', 32)
+        num_key_value_heads = self.registry.get_attention_config_value(attention_module, 'num_key_value_heads', num_heads)
+        hidden_size = self.registry.get_attention_config_value(attention_module, 'hidden_size', 4096)
+        head_dim = self.registry.get_attention_config_value(attention_module, 'head_dim', None)
+        
+        if head_dim is None:
+            head_dim = hidden_size // num_heads
+        
+        # Check for fused QKV projection (like Phi-3's qkv_proj)
+        qkv_fused_name = self.registry.get_attention_component_name(attention_module, 'qkv_proj')
+        if qkv_fused_name:
+            # Create wrapper modules for each component
+            fused_module = getattr(attention_module, qkv_fused_name)
+            
+            for comp_type in ['q_proj', 'k_proj', 'v_proj']:
+                wrapper = QKVSplitter(
+                    fused_module=fused_module,
+                    component_type=comp_type,
+                    num_heads=num_heads,
+                    num_kv_heads=num_key_value_heads,
+                    head_dim=head_dim
+                )
                 
                 components[comp_type] = AttentionComponentInfo(
-                    component_name=comp_name,
+                    component_name=f"{qkv_fused_name}_{comp_type}_wrapper",
                     component_type=comp_type,
-                    has_bias=module.bias is not None,
-                    weight_shape=weight_shape
+                    has_bias=fused_module.bias is not None,
+                    weight_shape=(wrapper.end_idx - wrapper.start_idx, fused_module.weight.shape[1])
                 )
+                
+                # Store the wrapper module for retrieval
+                setattr(self, f"_wrapper_{layer_idx}_{comp_type}", wrapper)
+        else:
+            # Handle separate Q, K, V projections as before
+            for comp_type in ['q_proj', 'k_proj', 'v_proj']:
+                comp_name = self.registry.get_attention_component_name(attention_module, comp_type)
+                if comp_name:
+                    module = getattr(attention_module, comp_name)
+                    
+                    # Handle legacy fused QKV (like GPT-2's c_attn)
+                    if comp_name == 'c_attn' and comp_type in ['q_proj', 'k_proj', 'v_proj']:
+                        # For legacy fused QKV, we need to handle this specially
+                        weight_shape = tuple(module.weight.shape)
+                    else:
+                        weight_shape = tuple(module.weight.shape)
+                    
+                    components[comp_type] = AttentionComponentInfo(
+                        component_name=comp_name,
+                        component_type=comp_type,
+                        has_bias=module.bias is not None,
+                        weight_shape=weight_shape
+                    )
+        
+        # Always check for output projection separately
+        o_proj_name = self.registry.get_attention_component_name(attention_module, 'o_proj')
+        if o_proj_name:
+            o_proj_module = getattr(attention_module, o_proj_name)
+            components['o_proj'] = AttentionComponentInfo(
+                component_name=o_proj_name,
+                component_type='o_proj',
+                has_bias=o_proj_module.bias is not None,
+                weight_shape=tuple(o_proj_module.weight.shape)
+            )
         
         # Detect attention type and parameters using the registry helper
         num_heads = self.registry.get_attention_config_value(attention_module, 'num_heads', 32)
@@ -379,7 +424,15 @@ class UniversalLayerHandler:
         if head_dim is None and 'q_proj' in components:
             # Calculate head_dim from q_proj weight dimensions
             q_proj_out_features = components['q_proj'].weight_shape[0]
-            head_dim = q_proj_out_features // num_heads
+            
+            # For fused QKV, the output dimension includes Q, K, V
+            if qkv_fused_name:
+                # For Phi-3 style fused QKV: output_dim = (num_heads + 2 * num_kv_heads) * head_dim
+                # So head_dim = output_dim / (num_heads + 2 * num_kv_heads)
+                head_dim = q_proj_out_features // (num_heads + 2 * num_key_value_heads)
+            else:
+                # For separate projections
+                head_dim = q_proj_out_features // num_heads
         elif head_dim is None:
             # Fallback calculation
             head_dim = hidden_size // num_heads
@@ -447,30 +500,39 @@ class UniversalLayerHandler:
     # Reuse existing MLP detection methods
     def _detect_mlp_architecture(self, mlp_module: nn.Module) -> MLPArchitectureInfo:
         """Detect MLP architecture and components"""
-        # This would be the same as the existing method in UniversalMLPHandler
         components = {}
         
-        # Check for gated architecture
-        gate_name = self.registry.get_component_name(mlp_module, 'gate')
-        up_name = self.registry.get_component_name(mlp_module, 'up')
+        # Check for fused gated architecture first (like Phi-3)
+        gate_up_fused_name = self.registry.get_component_name(mlp_module, 'gate_up_fused')
         down_name = self.registry.get_component_name(mlp_module, 'down')
         
-        if gate_name and up_name and down_name:
-            components = self._extract_mlp_components(mlp_module, ['gate', 'up', 'down'])
-            arch_type = MLPArchitectureType.GATED_MLP
+        if gate_up_fused_name and down_name:
+            components = self._extract_mlp_components(mlp_module, ['gate_up_fused', 'down'])
+            arch_type = MLPArchitectureType.FUSED_GATED_MLP
             has_gate = True
         else:
-            hidden_name = self.registry.get_component_name(mlp_module, 'hidden')
-            output_name = self.registry.get_component_name(mlp_module, 'output')
+            # Check for separate gated architecture
+            gate_name = self.registry.get_component_name(mlp_module, 'gate')
+            up_name = self.registry.get_component_name(mlp_module, 'up')
+            down_name = self.registry.get_component_name(mlp_module, 'down')
             
-            if hidden_name and output_name:
-                components = self._extract_mlp_components(mlp_module, ['hidden', 'output'])
-                arch_type = MLPArchitectureType.STANDARD_MLP
-                has_gate = False
+            if gate_name and up_name and down_name:
+                components = self._extract_mlp_components(mlp_module, ['gate', 'up', 'down'])
+                arch_type = MLPArchitectureType.GATED_MLP
+                has_gate = True
             else:
-                arch_type = MLPArchitectureType.UNKNOWN
-                has_gate = False
-        
+                # Check for standard MLP architecture
+                hidden_name = self.registry.get_component_name(mlp_module, 'hidden')
+                output_name = self.registry.get_component_name(mlp_module, 'output')
+                
+                if hidden_name and output_name:
+                    components = self._extract_mlp_components(mlp_module, ['hidden', 'output'])
+                    arch_type = MLPArchitectureType.STANDARD_MLP
+                    has_gate = False
+                else:
+                    arch_type = MLPArchitectureType.UNKNOWN
+                    has_gate = False
+    
         return MLPArchitectureInfo(
             architecture_type=arch_type,
             activation_function=self._detect_activation_function(mlp_module),
@@ -567,15 +629,21 @@ class UniversalLayerHandler:
     def get_attention_components(self, layer_idx: int) -> Dict[str, nn.Module]:
         """Get all attention components for a layer"""
         attention_info = self.get_attention_architecture(layer_idx)
-        
         attention_module = self.registry.find_attention_module(self.layers[layer_idx])
-        if attention_module is None:
-            raise ValueError(f"Could not find attention module in layer {layer_idx}")
-        
+    
         components = {}
         for comp_type, comp_info in attention_info.components.items():
-            components[comp_type] = getattr(attention_module, comp_info.component_name)
-        
+            if comp_info.component_name.endswith('_wrapper'):
+                # This is a wrapper module we created
+                wrapper_attr = f"_wrapper_{layer_idx}_{comp_type}"
+                if hasattr(self, wrapper_attr):
+                    components[comp_type] = getattr(self, wrapper_attr)
+                else:
+                    raise RuntimeError(f"Wrapper {wrapper_attr} not found")
+            else:
+                # Regular component
+                components[comp_type] = getattr(attention_module, comp_info.component_name)
+    
         return components
     
     def get_mlp_module(self, layer_idx: int) -> nn.Module:
@@ -761,6 +829,34 @@ class UniversalLayerHandler:
         
         return summary
 
+    def get_attention_constraints(self, layer_idx: int) -> Dict[str, Any]:
+        """Get attention pattern constraints for a specific layer."""
+        attention_info = self.get_attention_architecture(layer_idx)
+        
+        # Check for sliding window from architecture info
+        if attention_info.sliding_window is not None:
+            return {
+                'type': 'sliding_window',
+                'window_size': attention_info.sliding_window,
+                'has_constraints': True
+            }
+        
+        # Check model config as fallback
+        config = getattr(self.model, 'config', None)
+        if config is not None:
+            sliding_window = getattr(config, 'sliding_window', None)
+            if sliding_window is not None:
+                return {
+                    'type': 'sliding_window', 
+                    'window_size': sliding_window,
+                    'has_constraints': True
+                }
+        
+        return {
+            'type': 'full_attention',
+            'window_size': None,
+            'has_constraints': False
+        }
 
 # Convenience functions
 def create_layer_handler(model: nn.Module) -> UniversalLayerHandler:
@@ -834,3 +930,49 @@ class UniversalMLPHandler(UniversalLayerHandler):
             components[comp_type] = getattr(expert, comp_info.component_name)
         
         return components
+
+class QKVSplitter(nn.Module):
+    """Wrapper to split fused QKV projection into individual Q, K, V components"""
+    
+    def __init__(self, fused_module: nn.Module, component_type: str, 
+                 num_heads: int, num_kv_heads: int, head_dim: int):
+        super().__init__()
+        self.fused_module = fused_module
+        self.component_type = component_type
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads  
+        self.head_dim = head_dim
+        
+        # Calculate split indices for Q, K, V
+        q_size = num_heads * head_dim
+        k_size = num_kv_heads * head_dim  
+        v_size = num_kv_heads * head_dim
+        
+        if component_type == 'q_proj':
+            self.start_idx = 0
+            self.end_idx = q_size
+        elif component_type == 'k_proj':
+            self.start_idx = q_size
+            self.end_idx = q_size + k_size
+        elif component_type == 'v_proj':
+            self.start_idx = q_size + k_size
+            self.end_idx = q_size + k_size + v_size
+        else:
+            raise ValueError(f"Unknown component_type: {component_type}")
+    
+    @property
+    def weight(self):
+        """Return the slice of the fused weight matrix for this component"""
+        return self.fused_module.weight[self.start_idx:self.end_idx, :]
+    
+    @property 
+    def bias(self):
+        """Return the slice of the fused bias vector for this component"""
+        if self.fused_module.bias is None:
+            return None
+        return self.fused_module.bias[self.start_idx:self.end_idx]
+    
+    def forward(self, x):
+        """Forward pass through the fused module, then slice the output"""
+        fused_output = self.fused_module(x)  # [batch, seq, total_dim]
+        return fused_output[..., self.start_idx:self.end_idx]

@@ -216,12 +216,15 @@ def run_attack_for_super_weight(session, super_weight, hypothesis: str, logger: 
         logger.info(f"Attack completed. Final loss: {attack_result['final_loss']:.6f}")
         logger.info(f"Best adversarial string: '{attack_result['final_adv_string']}'")
         
+        # CLEAN UP ATTACKER IMMEDIATELY - don't store it
+        del attacker
+        
         return {
             'super_weight': super_weight,
             'hypothesis': hypothesis,
             'attack_result': attack_result,
-            'attacker': attacker,
-            'config': config
+            'config_params': config_params,  # Store config params instead for recreation
+            'attack_prompt': attack_prompt   # Store prompt for recreation
         }
         
     except Exception as e:
@@ -236,6 +239,17 @@ def validate_attack_consistency(session, attack_result: Dict[str, Any], logger: 
     logger.info(f"Validating attack consistency for {attack_result['super_weight']} (Hypothesis {attack_result['hypothesis']})")
     
     try:
+        # RECREATE ATTACKER from stored config
+        target = SuperWeightTarget(
+            super_weight=attack_result['super_weight'],
+            head_idx=None
+        )
+        config_params = attack_result['config_params'].copy()
+        config_params['target'] = target
+        config = SuperWeightAttackConfig(**config_params)
+        
+        attacker = SuperWeightAttacker(session.model, session.tokenizer, config, log_level=logging.WARNING)
+        
         # Get config parameters
         seeds = consistency_config.get('seeds', [41, 42, 43]) if consistency_config else [41, 42, 43]
         n_prompts = consistency_config.get('n_prompts', 100) if consistency_config else 100
@@ -244,7 +258,7 @@ def validate_attack_consistency(session, attack_result: Dict[str, Any], logger: 
         
         consistency_result = run_multi_seed_consistency_evaluation(
             session=session,
-            attacker=attack_result['attacker'],
+            attacker=attacker,
             adv_string=attack_result['attack_result']['final_adv_string'],
             seeds=seeds,
             n_prompts=n_prompts,
@@ -260,6 +274,9 @@ def validate_attack_consistency(session, attack_result: Dict[str, Any], logger: 
             show_progress=False,
             set_all_seeds_fn=set_all_seeds
         )
+        
+        # CLEAN UP ATTACKER IMMEDIATELY
+        del attacker
         
         # Check if attack passes consistency tests
         overall_pass = consistency_result.get('final_evaluation', {}).get('pass_fail', False)
@@ -279,6 +296,17 @@ def run_perplexity_evaluation(session, attack_result: Dict[str, Any], logger: lo
     logger.info(f"Running perplexity bake-off for {attack_result['super_weight']} (Hypothesis {attack_result['hypothesis']})")
     
     try:
+        # RECREATE ATTACKER from stored config
+        target = SuperWeightTarget(
+            super_weight=attack_result['super_weight'],
+            head_idx=None
+        )
+        config_params = attack_result['config_params'].copy()
+        config_params['target'] = target
+        config = SuperWeightAttackConfig(**config_params)
+        
+        attacker = SuperWeightAttacker(session.model, session.tokenizer, config, log_level=logging.WARNING)
+        
         # Get config parameters
         batch_size = bakeoff_config.get('batch_size', 16) if bakeoff_config else 16
         min_tokens = bakeoff_config.get('min_tokens', 50) if bakeoff_config else 50
@@ -287,7 +315,7 @@ def run_perplexity_evaluation(session, attack_result: Dict[str, Any], logger: lo
         
         bakeoff_result = run_perplexity_bakeoff(
             session=session,
-            attacker=attack_result['attacker'],
+            attacker=attacker,
             target_sw=attack_result['super_weight'],
             adv_prefix=attack_result['attack_result']['final_adv_string'],
             prompts=None,  # Will sample automatically
@@ -302,6 +330,9 @@ def run_perplexity_evaluation(session, attack_result: Dict[str, Any], logger: lo
             min_tokens=min_tokens,
             max_tokens=max_tokens
         )
+        
+        # CLEAN UP ATTACKER IMMEDIATELY
+        del attacker
         
         # Plot and save results in model-specific plots directory
         plot_filename = f"perplexity_bakeoff_{attack_result['super_weight'].layer}_{attack_result['super_weight'].row}_{attack_result['super_weight'].column}_{attack_result['hypothesis']}.png"
@@ -605,6 +636,7 @@ def process_model(model_name: str, output_dir: Path, logger: logging.Logger, arg
         
         # Clean up CUDA memory between super weights
         if torch.cuda.is_available():
+            torch.cuda.synchronize()  # Wait for all operations to complete
             torch.cuda.empty_cache()
         
         for hypothesis in args.hypotheses:
@@ -635,11 +667,33 @@ def process_model(model_name: str, output_dir: Path, logger: logging.Logger, arg
     save_results(results, output_dir, model_name)
     
     logger.info(f"Model processing completed: {model_name}")
-    # Also clean up the session object explicitly
+    
+    # AGGRESSIVE CLEANUP
     try:
+        # Clear model references more thoroughly
+        session.model = None
+        session.tokenizer = None  
+        session.mlp_handler = None
         del session
-    except:
-        pass
+        
+        # Force garbage collection multiple times
+        import gc
+        for _ in range(3):
+            gc.collect()
+        
+        # Clear PyTorch cache and synchronize
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            
+            # Log memory after cleanup
+            for i in range(torch.cuda.device_count()):
+                memory_allocated = torch.cuda.memory_allocated(i) / 1024**3
+                logger.info(f"After cleanup - GPU {i}: {memory_allocated:.2f}GB allocated")
+                
+    except Exception as e:
+        logger.warning(f"Cleanup warning: {e}")
 
     return results
 
