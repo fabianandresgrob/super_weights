@@ -168,26 +168,48 @@ class SuperWeightResearchSession:
     def detect_super_weights(self, 
                            input_text: str = "Apple Inc. is a worldwide tech company.",
                            spike_threshold: float = 50.0,
-                           max_iterations: int = 10) -> List:
+                           max_iterations: int = 10,
+                           # Enhanced MoE parameters
+                           router_analysis_samples: int = 5,
+                           p_active_floor: float = 0.01,
+                           co_spike_threshold: float = 0.12,
+                           enable_causal_scoring: bool = True) -> List:
         """
-        Detect super weights and store them in the session.
+        Detect super weights with enhanced MoE support.
         
         Args:
             input_text: Text to use for detection
-            spike_threshold: Threshold for detecting activation spikes
+            spike_threshold: Legacy threshold for dense models
             max_iterations: Maximum detection iterations
+            router_analysis_samples: Number of samples for MoE router analysis
+            p_active_floor: Minimum p_active threshold for expert consideration
+            co_spike_threshold: Threshold for co-spike alignment score S^(l,e)(r,c)
+            enable_causal_scoring: Whether to compute causal impact scores
             
         Returns:
-            List of detected SuperWeight objects
+            List of detected SuperWeight objects (or MoESuperWeight for MoE models)
         """
         self.logger.info("Starting super weight detection")
         
-        # Run detection
-        self.detected_super_weights = self.detector.detect_super_weights(
-            input_text=input_text,
-            spike_threshold=spike_threshold,
-            max_iterations=max_iterations
-        )
+        # Run detection with appropriate parameters
+        if self.model_info['is_moe']:
+            # Enhanced MoE detection with new parameters
+            self.detected_super_weights = self.detector.detect_super_weights(
+                input_text=input_text,
+                spike_threshold=spike_threshold,  # Keep for backward compatibility
+                max_iterations=max_iterations,
+                router_analysis_samples=router_analysis_samples,
+                p_active_floor=p_active_floor,
+                co_spike_threshold=co_spike_threshold,
+                enable_causal_scoring=enable_causal_scoring
+            )
+        else:
+            # Standard dense detection
+            self.detected_super_weights = self.detector.detect_super_weights(
+                input_text=input_text,
+                spike_threshold=spike_threshold,
+                max_iterations=max_iterations
+            )
         
         self.logger.info(f"Detection complete. Found {len(self.detected_super_weights)} super weights")
         
@@ -323,7 +345,22 @@ class SuperWeightResearchSession:
         
         # Default configurations
         if detection_config is None:
-            detection_config = {}
+            if self.model_info['is_moe']:
+                # Enhanced MoE detection config
+                detection_config = {
+                    'spike_threshold': 50.0,
+                    'max_iterations': 10,
+                    'router_analysis_samples': 8,
+                    'p_active_floor': 0.01,
+                    'co_spike_threshold': 0.12,
+                    'enable_causal_scoring': True
+                }
+            else:
+                # Standard dense detection config
+                detection_config = {
+                    'spike_threshold': 50.0,
+                    'max_iterations': 10
+                }
         if screening_config is None:
             screening_config = {}
         if analysis_config is None:
