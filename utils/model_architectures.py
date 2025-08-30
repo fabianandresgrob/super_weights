@@ -930,6 +930,54 @@ class UniversalMLPHandler(UniversalLayerHandler):
             components[comp_type] = getattr(expert, comp_info.component_name)
         
         return components
+    
+    def get_routing_info(self, layer_idx: int) -> Optional[MoERoutingInfo]:
+        """Get routing information for an MoE layer"""
+        if not self.is_moe_layer(layer_idx):
+            return None
+        
+        arch_info = self.get_mlp_architecture(layer_idx)
+        if arch_info.is_moe and arch_info.moe_info:
+            return arch_info.moe_info.routing_info
+        return None
+    
+    def get_router_module(self, layer_idx: int) -> Optional[nn.Module]:
+        """Get the router module for an MoE layer"""
+        if not self.is_moe_layer(layer_idx):
+            return None
+        
+        moe_module = self.get_mlp_module(layer_idx)
+        if moe_module is None:
+            return None
+        
+        # Try common router names
+        for router_name in ['gate', 'router', 'switch']:
+            if hasattr(moe_module, router_name):
+                return getattr(moe_module, router_name)
+        
+        return None
+    
+    def get_expert_module(self, layer_idx: int, expert_idx: int) -> Optional[nn.Module]:
+        """Get a specific expert module"""
+        if not self.is_moe_layer(layer_idx):
+            return None
+        
+        experts = self.get_moe_experts(layer_idx)
+        if expert_idx < len(experts):
+            return experts[expert_idx]
+        return None
+    
+    def get_expert_component_name(self, layer_idx: int, expert_idx: int, component_type: str) -> Optional[str]:
+        """Get the actual module name for an expert component"""
+        expert_module = self.get_expert_module(layer_idx, expert_idx)
+        if expert_module is None:
+            return None
+        
+        # Use the registry to find the component name
+        component_name = self.registry.get_component_name(expert_module, component_type)
+        if component_name:
+            return f"experts.{expert_idx}.{component_name}"
+        return None
 
 class QKVSplitter(nn.Module):
     """Wrapper to split fused QKV projection into individual Q, K, V components"""
