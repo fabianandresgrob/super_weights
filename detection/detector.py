@@ -350,6 +350,8 @@ class MoESuperWeightDetector(BaseSuperWeightDetector):
         
         # Cache for expert activation patterns
         self.expert_activation_cache = {}
+
+        self._temp_modified_weights = {}  # Store original values for restoration
         
         self.logger.info(f"Initialized MoE detector for {self.architecture_type} architecture")
     
@@ -428,7 +430,9 @@ class MoESuperWeightDetector(BaseSuperWeightDetector):
                     if router_module:
                         hook = router_module.register_forward_hook(create_router_hook(layer_idx))
                         router_hooks.append(hook)
-            
+                    else:
+                        self.logger.warning(f"No router module found for MoE layer {layer_idx}")
+
             # Run forward pass
             with torch.no_grad():
                 self.model(**tokens)
@@ -478,85 +482,136 @@ class MoESuperWeightDetector(BaseSuperWeightDetector):
         
         return samples[:num_samples]
     
-    def _extract_selected_experts(self, router_output, routing_info) -> List[int]:
-        """Extract selected expert indices from router output"""
-        # This depends on the routing implementation
-        # For top-k routing, we need to find the top-k experts
-        
-        if torch.is_tensor(router_output):
-            # For tensor output, find top-k
-            k = routing_info.experts_per_token if routing_info else 2
+    def _extract_selected_experts(self, router_output, routing_info, layer_idx: int) -> List[int]:
+        """Extract selected expert indices from router output with robust parsing"""
+        try:
+            # Detect model type for specific handling
+            model_config = getattr(self.model, 'config', None)
+            model_type = getattr(model_config, 'model_type', '').lower()
             
-            # Handle different tensor shapes
-            if len(router_output.shape) > 1:
-                # Flatten across batch and sequence dimensions, keep expert dimension
-                # Shape: [batch, seq, num_experts] -> [batch*seq, num_experts]
-                router_flat = router_output.view(-1, router_output.shape[-1])
-                # Take top-k for each token
-                _, indices = torch.topk(router_flat, k, dim=-1)
-                # Get unique expert indices across all tokens
-                unique_experts = torch.unique(indices).tolist()
-                return unique_experts
-            else:
-                # 1D tensor, just take top-k
-                _, indices = torch.topk(router_output, k)
-                return indices.tolist()
-        elif hasattr(router_output, 'indices') and hasattr(router_output, 'values'):
-            # Some routers return structured output with indices and values
-            if hasattr(router_output.indices, 'flatten'):
-                return router_output.indices.flatten().tolist()
-            else:
-                return router_output.indices.tolist()
-        else:
-            # Fallback: use architecture info to get default expert count
-            # Check if we can find a MoE layer to get the number of experts
-            for layer_idx in range(self.num_layers):
-                if self.mlp_handler.is_moe_layer(layer_idx):
-                    arch_info = self.mlp_handler.get_mlp_architecture(layer_idx)
-                    if arch_info.is_moe and arch_info.moe_info:
-                        num_experts = arch_info.moe_info.num_experts
-                        return list(range(min(2, num_experts)))
+            if 'mixtral' in model_type or 'mistral' in model_type:
+                # Mixtral-specific handling
+                if hasattr(router_output, 'indices'):
+                    return router_output.indices.flatten().unique().tolist()
+                elif isinstance(router_output, tuple) and len(router_output) >= 2:
+                    # router_output might be (router_logits, indices)
+                    indices = router_output[1]
+                    if torch.is_tensor(indices):
+                        return indices.flatten().unique().tolist()
             
-            # Final fallback
-            return [0, 1]
-    
+            # Generic tensor handling
+            if torch.is_tensor(router_output):
+                # Assume it's router logits, get top-k
+                k = getattr(routing_info, 'experts_per_token', 2) if routing_info else 2
+                
+                if len(router_output.shape) == 2:  # [seq_len, num_experts]
+                    # Get top-k across all sequence positions
+                    _, indices = torch.topk(router_output, k, dim=-1)
+                    return torch.unique(indices.flatten()).tolist()
+                elif len(router_output.shape) == 3:  # [batch, seq_len, num_experts]
+                    # Flatten batch and sequence dimensions
+                    flat_output = router_output.view(-1, router_output.shape[-1])
+                    _, indices = torch.topk(flat_output, k, dim=-1)
+                    return torch.unique(indices.flatten()).tolist()
+            
+            # Fallback: assume it's already indices
+            if isinstance(router_output, (list, tuple)):
+                return list(router_output)
+            
+            self.logger.warning(f"Could not parse router output format for layer {layer_idx}")
+            return []
+            
+        except Exception as e:
+            self.logger.error(f"Error parsing router output for layer {layer_idx}: {e}")
+            return []
+
     def _detect_active_expert_super_weights(self, input_text: str, 
                                           active_experts: Dict[int, List[int]], 
                                           spike_threshold: float, 
                                           max_iterations: int) -> List[MoESuperWeight]:
-        """Detect super weights in active experts only"""
-        tokens = self.tokenizer(input_text, return_tensors='pt').to(self.model.device)
-        all_super_weights = []
+        """Detect super weights in active experts with iterative suppression"""
+        detected_super_weights = []
         processed_coordinates = set()
         
+        tokens = self.tokenizer(input_text, return_tensors='pt').to(self.device)
+        
         for iteration in range(max_iterations):
-            self.logger.info(f"Iteration {iteration + 1}/{max_iterations}")
+            self.logger.info(f"MoE Detection iteration {iteration + 1}/{max_iterations}")
             
             iteration_super_weights = []
             
-            # Process each layer with active experts
             for layer_idx, expert_indices in active_experts.items():
                 layer_super_weights = self._detect_layer_expert_super_weights(
                     tokens, layer_idx, expert_indices, spike_threshold, iteration
                 )
                 
-                # Filter duplicates
-                unique_layer_super_weights = []
+                # Filter out already processed coordinates
+                new_super_weights = []
                 for sw in layer_super_weights:
-                    if sw.weight_key not in processed_coordinates:
-                        unique_layer_super_weights.append(sw)
-                        processed_coordinates.add(sw.weight_key)
+                    coord = (sw.layer, sw.expert_id, sw.row, sw.column)
+                    if coord not in processed_coordinates:
+                        new_super_weights.append(sw)
+                        processed_coordinates.add(coord)
                 
-                iteration_super_weights.extend(unique_layer_super_weights)
+                iteration_super_weights.extend(new_super_weights)
             
             if not iteration_super_weights:
-                self.logger.info(f"No super weights found in iteration {iteration + 1}")
+                self.logger.info(f"No new super weights found in iteration {iteration + 1}")
                 break
             
-            all_super_weights.extend(iteration_super_weights)
-            self.logger.info(f"Found {len(iteration_super_weights)} super weights in iteration {iteration + 1}")
+            detected_super_weights.extend(iteration_super_weights)
+            
+            # Zero the detected weights for next iteration
+            if iteration < max_iterations - 1:  # Don't zero on last iteration
+                self._temporarily_zero_weights(iteration_super_weights)
         
-        return all_super_weights
+        # Restore all weights after detection
+        self._restore_all_weights()
+        
+        return detected_super_weights
+    
+    def _temporarily_zero_weights(self, super_weights: List[MoESuperWeight]):
+        """Temporarily zero detected super weights"""
+        for sw in super_weights:
+            try:
+                # Get the expert module and component
+                expert_module = self.mlp_handler.get_expert_module(sw.layer, sw.expert_id)
+                if expert_module:
+                    component_parts = sw.component.split('.')[-1]  # Get last part (e.g., 'down_proj')
+                    if hasattr(expert_module, component_parts):
+                        component_module = getattr(expert_module, component_parts)
+                        if hasattr(component_module, 'weight'):
+                            # ✅ Store original value for restoration
+                            coord_key = (sw.layer, sw.expert_id, sw.row, sw.column)
+                            original_value = component_module.weight.data[sw.row, sw.column].clone()
+                            self._temp_modified_weights[coord_key] = original_value
+                            
+                            # Zero the weight
+                            component_module.weight.data[sw.row, sw.column] = 0.0
+            except Exception as e:
+                self.logger.warning(f"Could not zero super weight {sw}: {e}")
+    
+    def _restore_all_weights(self):
+        """Restore all temporarily modified weights"""
+        for (layer_idx, expert_id, row, col), original_value in self._temp_modified_weights.items():
+            try:
+                expert_module = self.mlp_handler.get_expert_module(layer_idx, expert_id)
+                if expert_module:
+                    # Find the component - this is tricky, we need to reverse-engineer it
+                    for comp_type in ['down', 'output']:  # Try common component types
+                        expert_components = self.mlp_handler.get_expert_components(layer_idx, expert_id)
+                        if comp_type in expert_components:
+                            component_module = expert_components[comp_type]
+                            if hasattr(component_module, 'weight'):
+                                if (component_module.weight.shape[0] > row and 
+                                    component_module.weight.shape[1] > col):
+                                    component_module.weight.data[row, col] = original_value
+                                    break
+            except Exception as e:
+                self.logger.warning(f"Could not restore weight at ({layer_idx}, {expert_id}, {row}, {col}): {e}")
+        
+        # Clear the storage
+        self._temp_modified_weights.clear()
     
     def _detect_layer_expert_super_weights(self, tokens, layer_idx: int, 
                                          expert_indices: List[int], 
@@ -635,6 +690,12 @@ class MoESuperWeightDetector(BaseSuperWeightDetector):
         """Find super weights in a specific expert component"""
         
         super_weights = []
+
+        # Get the actual component name for this expert
+        component_name = self.mlp_handler.get_expert_component_name(layer_idx, expert_idx, component_type)
+        if not component_name:
+            self.logger.warning(f"Could not get component name for expert {expert_idx} in layer {layer_idx}")
+            return super_weights
         
         # Process tensors (similar to standard detector)
         if len(input_tensor.shape) == 3:  # [batch, seq, hidden]
@@ -663,8 +724,8 @@ class MoESuperWeightDetector(BaseSuperWeightDetector):
                     # Create MoESuperWeight
                     super_weight = MoESuperWeight(
                         layer=layer_idx,
-                        expert=expert_idx,
-                        component=f"experts.{expert_idx}.{component_type}",
+                        expert_id=expert_idx,
+                        component=component_name,
                         row=output_channel,
                         column=input_channel,
                         input_value=input_value,

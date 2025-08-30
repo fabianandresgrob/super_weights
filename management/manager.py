@@ -3,7 +3,7 @@ import logging
 from typing import Dict, List, Set, Union, Tuple, Optional
 from contextlib import contextmanager
 
-from detection.super_weight import SuperWeight
+from detection.super_weight import SuperWeight, MoESuperWeight
 from utils.model_architectures import UniversalMLPHandler
 
 
@@ -47,30 +47,39 @@ class SuperWeightManager:
         # Check if this is an MoE layer
         if self.mlp_handler.is_moe_layer(layer_idx):
             # For MoE, we need to parse the component path
-            if hasattr(super_weight, 'component') and super_weight.component:
+            if hasattr(super_weight, 'expert_id'):
+                expert_idx = super_weight.expert_id
+                component_path = super_weight.component
+                
                 # Parse component path like "experts.0.down_proj"
-                parts = super_weight.component.split('.')
+                parts = component_path.split('.')
                 if len(parts) >= 3 and parts[0] == 'experts':
-                    expert_idx = int(parts[1])
-                    component_name = parts[2]
+                    component_name = parts[2]  # e.g., 'down_proj'
                     
-                    # Get expert components
+                    # Get expert components using the handler method
                     expert_components = self.mlp_handler.get_expert_components(layer_idx, expert_idx)
                     
-                    # Find the right component
+                    # Find the matching component by name
                     for comp_type, module in expert_components.items():
+                        # Get the component info to check the actual name
                         arch_info = self.mlp_handler.get_mlp_architecture(layer_idx)
-                        expert_info = arch_info.moe_info.experts[expert_idx]
-                        comp_info = expert_info.components[comp_type]
-                        
-                        if comp_info.component_name == component_name:
-                            return module
+                        if (arch_info.is_moe and arch_info.moe_info and 
+                            len(self.mlp_handler.get_moe_experts(layer_idx)) > expert_idx):
+                            
+                            # Get first expert architecture as template
+                            first_expert = self.mlp_handler.get_moe_experts(layer_idx)[0]
+                            expert_arch = self.mlp_handler._detect_mlp_architecture(first_expert)
+                            
+                            if comp_type in expert_arch.components:
+                                comp_info = expert_arch.components[comp_type]
+                                if comp_info.component_name == component_name:
+                                    return module
                     
                     raise ValueError(f"Component {component_name} not found in expert {expert_idx}")
                 else:
-                    raise ValueError(f"Invalid MoE component path: {super_weight.component}")
+                    raise ValueError(f"Invalid MoE component path: {component_path}")
             else:
-                raise ValueError(f"MoE super weight missing component information: {super_weight}")
+                raise ValueError(f"MoE super weight missing expert_id: {super_weight}")
         else:
             # Regular MLP layer
             components = self.mlp_handler.get_mlp_components(layer_idx)
