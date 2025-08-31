@@ -94,7 +94,8 @@ class ComprehensiveAnalysisRunner:
             detection_params = detection_params or {
                 'input_text': "Apple Inc. is a worldwide tech company.",
                 'spike_threshold': 50.0,
-                'max_iterations': 10
+                'max_iterations': 10,
+                'router_analysis_samples': 5
             }
             
             super_weights = session.detect_super_weights(**detection_params)

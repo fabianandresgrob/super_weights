@@ -164,33 +164,50 @@ class SuperWeightResearchSession:
         
         return logger
     
-    def detect_super_weights(self, 
+    def detect_super_weights(self,
                            input_text: str = "Apple Inc. is a worldwide tech company.",
                            spike_threshold: float = 50.0,
-                           max_iterations: int = 10) -> List:
+                           max_iterations: int = 10,
+                           router_analysis_samples: int = 5) -> List:
         """
         Detect super weights and store them in the session.
-        
+
         Args:
             input_text: Text to use for detection
             spike_threshold: Threshold for detecting activation spikes
             max_iterations: Maximum detection iterations
-            
+            router_analysis_samples: Number of input samples to use when
+                estimating routing statistics for MoE models
+
         Returns:
             List of detected SuperWeight objects
         """
         self.logger.info("Starting super weight detection")
-        
+
+        # Build detector parameters based on detector type
+        detect_kwargs = {
+            "input_text": input_text,
+            "spike_threshold": spike_threshold,
+            "max_iterations": max_iterations,
+        }
+
+        # Only MoE detector accepts router_analysis_samples
+        if isinstance(self.detector, MoESuperWeightDetector):
+            detect_kwargs["router_analysis_samples"] = router_analysis_samples
+
         # Run detection
-        self.detected_super_weights = self.detector.detect_super_weights(
-            input_text=input_text,
-            spike_threshold=spike_threshold,
-            max_iterations=max_iterations
+        self.detected_super_weights = self.detector.detect_super_weights(**detect_kwargs)
+
+        self.logger.info(
+            f"Detection complete. Found {len(self.detected_super_weights)} super weights"
         )
-        
-        self.logger.info(f"Detection complete. Found {len(self.detected_super_weights)} super weights")
-        
+
         return self.detected_super_weights
+
+    # Backwards-compatible alias
+    def detect(self, *args, **kwargs):
+        """Alias for detect_super_weights for API compatibility."""
+        return self.detect_super_weights(*args, **kwargs)
     
     def quick_screening(self, super_weights: List = None) -> List[Dict]:
         """

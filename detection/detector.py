@@ -340,20 +340,33 @@ class MoESuperWeightDetector(BaseSuperWeightDetector):
     Super weight detector specialized for MoE models.
     Uses a two-phase approach: router analysis + active expert analysis.
     """
-    
-    def __init__(self, model, tokenizer, mlp_handler: UniversalMLPHandler, 
-                 architecture_type: str, log_level=logging.INFO):
+
+    def __init__(self, model, tokenizer, mlp_handler: UniversalMLPHandler,
+                 architecture_type: str, log_level=logging.INFO,
+                 p_active_floor: float = 0.01,
+                 routing_entropy_factor: float = 0.7,
+                 co_spike_tau: float = 0.1):
         super().__init__(model, tokenizer, mlp_handler, log_level)
-        
+
         # MoE-specific initialization
         self.architecture_type = architecture_type
-        
-        # Cache for expert activation patterns
+
+        # Thresholds and configuration
+        self.p_active_floor = p_active_floor
+        self.routing_entropy_factor = routing_entropy_factor
+        self.co_spike_tau = co_spike_tau
+
+        # Cache for router statistics
+        # layer_idx -> {"p_active": {...}, "pos_entropy": {...}, "low_entropy_positions": [...],
+        #                "overflow": float}
         self.expert_activation_cache = {}
 
-        self._temp_modified_weights = {}  # Store original values for restoration
-        
-        self.logger.info(f"Initialized MoE detector for {self.architecture_type} architecture")
+        # Storage for temporary weight modifications
+        self._temp_modified_weights = {}
+
+        self.logger.info(
+            f"Initialized MoE detector for {self.architecture_type} architecture"
+        )
     
     def detect_super_weights(self, 
                        input_text: str = "Apple Inc. is a worldwide tech company.",
@@ -394,69 +407,134 @@ class MoESuperWeightDetector(BaseSuperWeightDetector):
         return super_weights
     
     def _analyze_router_patterns(self, input_text: str, num_samples: int) -> Dict[int, List[int]]:
-        """
-        Analyze router patterns to identify frequently activated experts.
-        
+        """Gather routing statistics and select active experts.
+
+        This replaces the previous hard ``>50%`` activation filter.  For each
+        MoE layer we compute the probability that an expert is active
+        (``p_active``) and the position wise routing entropy.  Experts are kept if
+        their ``p_active`` exceeds ``p_active_floor`` *or* if they appear in any
+        low entropy token position.
+
         Returns:
-            Dict mapping layer_idx -> list of frequently activated expert indices
+            Mapping layer_idx -> list of selected expert indices.
         """
-        # Get sample inputs (could be variations of the input or different texts)
+
         sample_inputs = self._generate_sample_inputs(input_text, num_samples)
-        
-        # Track expert activations across samples
-        expert_activations = defaultdict(lambda: defaultdict(int))
-        
+
+        # Collect per-layer statistics
+        layer_stats: Dict[int, Dict] = defaultdict(
+            lambda: {
+                "usage": defaultdict(float),
+                "pos_counts": defaultdict(lambda: defaultdict(int)),
+                "total_tokens": 0,
+            }
+        )
+
         for sample_idx, sample_text in enumerate(sample_inputs):
             self.logger.debug(f"Processing sample {sample_idx + 1}/{num_samples}")
-            tokens = self.tokenizer(sample_text, return_tensors='pt').to(self.model.device)
-            
-            # Hook routers to capture expert selections
-            router_hooks = []
-            
-            def create_router_hook(layer_idx: int):
-                def hook(module, input, output):
-                    # Extract expert selections from router output
-                    routing_info = self.mlp_handler.get_routing_info(layer_idx)
-                    if routing_info:
-                        selected_experts = self._extract_selected_experts(output, routing_info)
-                        for expert_idx in selected_experts:
-                            expert_activations[layer_idx][expert_idx] += 1
-                return hook
-            
-            # Hook routers in MoE layers - check each layer dynamically
-            for layer_idx in range(self.num_layers):
-                if self.mlp_handler.is_moe_layer(layer_idx):
-                    router_module = self.mlp_handler.get_router_module(layer_idx)
-                    if router_module:
-                        hook = router_module.register_forward_hook(create_router_hook(layer_idx))
-                        router_hooks.append(hook)
-                    else:
-                        self.logger.warning(f"No router module found for MoE layer {layer_idx}")
+            tokens = self.tokenizer(sample_text, return_tensors="pt").to(self.device)
 
-            # Run forward pass
+            router_hooks = []
+
+            def make_router_hook(layer_idx: int):
+                def hook(module, inp, out):
+                    routing_info = self.mlp_handler.get_routing_info(layer_idx)
+                    k = getattr(routing_info, "experts_per_token", 2) if routing_info else 2
+
+                    if not torch.is_tensor(out):
+                        return
+
+                    # Assume out is router logits; convert to probabilities
+                    logits = out
+                    if logits.dim() == 2:  # [seq, experts]
+                        probs = torch.softmax(logits, dim=-1)
+                        probs = probs.unsqueeze(0)  # add batch dim
+                    else:  # [batch, seq, experts]
+                        probs = torch.softmax(logits, dim=-1)
+
+                    top_p, top_idx = torch.topk(probs, k, dim=-1)
+                    batch, seq_len, _ = top_idx.shape
+                    stats = layer_stats[layer_idx]
+                    for b in range(batch):
+                        for pos in range(seq_len):
+                            stats["total_tokens"] += 1
+                            for j in range(k):
+                                e = int(top_idx[b, pos, j])
+                                stats["usage"][e] += 1
+                                stats["pos_counts"][pos][e] += 1
+
+                return hook
+
+            for layer_idx in range(self.num_layers):
+                if not self.mlp_handler.is_moe_layer(layer_idx):
+                    continue
+                router_module = self.mlp_handler.get_router_module(layer_idx)
+                if router_module is None:
+                    continue
+                hook = router_module.register_forward_hook(make_router_hook(layer_idx))
+                router_hooks.append(hook)
+
             with torch.no_grad():
                 self.model(**tokens)
-            
-            # Clean up hooks
-            for hook in router_hooks:
-                hook.remove()
-        
-        # Identify frequently activated experts (activated in >50% of samples)
-        activation_threshold = num_samples * 0.5
-        active_experts = {}
-        
-        for layer_idx, expert_counts in expert_activations.items():
-            active_expert_list = [
-                expert_idx for expert_idx, count in expert_counts.items()
-                if count >= activation_threshold
-            ]
-            if active_expert_list:
-                active_experts[layer_idx] = active_expert_list
-        
-        # Log results
-        for layer_idx, experts in active_experts.items():
-            self.logger.info(f"Layer {layer_idx}: Active experts {experts}")
-        
+
+            for h in router_hooks:
+                h.remove()
+
+        active_experts: Dict[int, List[int]] = {}
+
+        for layer_idx, stats in layer_stats.items():
+            total_tokens = max(stats["total_tokens"], 1)
+            usage = stats["usage"]
+            p_active = {e: cnt / total_tokens for e, cnt in usage.items()}
+
+            # Position-wise entropy
+            pos_entropy = {}
+            for pos, counts in stats["pos_counts"].items():
+                total = sum(counts.values())
+                if total == 0:
+                    continue
+                probs = torch.tensor([c / total for c in counts.values()], dtype=torch.float)
+                entropy = (-probs * torch.log(probs + 1e-8)).sum().item()
+                pos_entropy[pos] = entropy
+
+            # Determine low entropy positions
+            if pos_entropy:
+                median_entropy = torch.median(torch.tensor(list(pos_entropy.values()))).item()
+                H_thr = self.routing_entropy_factor * median_entropy
+                low_entropy_pos = {
+                    pos for pos, H in pos_entropy.items() if H <= H_thr
+                }
+            else:
+                H_thr = 0.0
+                low_entropy_pos = set()
+
+            # Select experts
+            selected = []
+            for e in usage.keys():
+                if p_active.get(e, 0.0) >= self.p_active_floor:
+                    selected.append(e)
+                    continue
+                # check if expert routes through any low entropy positions
+                for pos in low_entropy_pos:
+                    if stats["pos_counts"][pos].get(e, 0) > 0:
+                        selected.append(e)
+                        break
+
+            if selected:
+                active_experts[layer_idx] = selected
+
+            # Store stats for later use
+            self.expert_activation_cache[layer_idx] = {
+                "p_active": p_active,
+                "pos_entropy": pos_entropy,
+                "low_entropy_positions": list(low_entropy_pos),
+                "overflow": 0.0,  # capacity overflow tracking not implemented
+            }
+
+            self.logger.info(
+                f"Layer {layer_idx}: selected experts {selected} (p_active floor {self.p_active_floor})"
+            )
+
         return active_experts
     
     def _generate_sample_inputs(self, base_text: str, num_samples: int) -> List[str]:
@@ -613,126 +691,295 @@ class MoESuperWeightDetector(BaseSuperWeightDetector):
         # Clear the storage
         self._temp_modified_weights.clear()
     
-    def _detect_layer_expert_super_weights(self, tokens, layer_idx: int, 
-                                         expert_indices: List[int], 
-                                         spike_threshold: float, 
+    def _detect_layer_expert_super_weights(self, tokens, layer_idx: int,
+                                         expert_indices: List[int],
+                                         spike_threshold: float,
                                          iteration: int) -> List[MoESuperWeight]:
-        """Detect super weights in specific experts of a layer"""
-        
-        super_weights = []
+        """Detect super weights in specific experts of a layer.
+
+        This function now records routing information so that activations are
+        computed only on tokens that were actually routed to a given expert.
+        """
+
+        super_weights: List[MoESuperWeight] = []
         hooks = []
-        
-        # Storage for activations
-        expert_activations = {}
-        
+
+        expert_activations: Dict[int, Dict[str, torch.Tensor]] = {}
+        routing_map: Dict[int, List[int]] = defaultdict(list)
+
         def create_expert_hook(expert_idx: int, component_type: str):
             def hook(module, input, output):
-                # Store input/output for this expert
                 if isinstance(input, tuple):
                     input_tensor = input[0].detach()
                 else:
                     input_tensor = input.detach()
-                
                 output_tensor = output.detach()
-                
                 expert_activations[expert_idx] = {
-                    'input': input_tensor,
-                    'output': output_tensor,
-                    'component_type': component_type,
-                    'module': module
+                    "input": input_tensor,
+                    "output": output_tensor,
+                    "component_type": component_type,
+                    "module": module,
                 }
+
             return hook
-        
+
+        # Hook router to capture token -> expert mapping
+        router_module = self.mlp_handler.get_router_module(layer_idx)
+        routing_info = self.mlp_handler.get_routing_info(layer_idx)
+        router_hook = None
+        if router_module is not None:
+            def router_hook_fn(module, inp, out):
+                k = getattr(routing_info, "experts_per_token", 2) if routing_info else 2
+                if not torch.is_tensor(out):
+                    return
+                logits = out
+                if logits.dim() == 2:
+                    probs = torch.softmax(logits, dim=-1).unsqueeze(0)
+                else:
+                    probs = torch.softmax(logits, dim=-1)
+                _, idx = torch.topk(probs, k, dim=-1)
+                batch, seq_len, _ = idx.shape
+                for b in range(batch):
+                    for pos in range(seq_len):
+                        token_idx = b * seq_len + pos
+                        for j in range(k):
+                            e = int(idx[b, pos, j])
+                            routing_map[e].append(token_idx)
+
+            router_hook = router_module.register_forward_hook(router_hook_fn)
+            hooks.append(router_hook)
+
         # Hook only the down/output projection of active experts
         for expert_idx in expert_indices:
             try:
                 expert_components = self.mlp_handler.get_expert_components(layer_idx, expert_idx)
-                
-                # Hook the output projection component (down or output)
                 for comp_type, module in expert_components.items():
-                    if comp_type in ['down', 'output']:
+                    if comp_type in ["down", "output"]:
                         hook = module.register_forward_hook(
                             create_expert_hook(expert_idx, comp_type)
                         )
                         hooks.append(hook)
-                        break  # Only hook one component per expert
+                        break
             except Exception as e:
-                self.logger.warning(f"Failed to hook expert {expert_idx} in layer {layer_idx}: {e}")
-        
-        # Run forward pass
+                self.logger.warning(
+                    f"Failed to hook expert {expert_idx} in layer {layer_idx}: {e}"
+                )
+
         with torch.no_grad():
             self.model(**tokens)
-        
-        # Clean up hooks
+
         for hook in hooks:
             hook.remove()
-        
+
         # Analyze activations for super weights
         for expert_idx, activation_data in expert_activations.items():
-            input_tensor = activation_data['input']
-            output_tensor = activation_data['output']
-            component_type = activation_data['component_type']
-            module = activation_data['module']
-            
-            # Find super weights using similar logic to standard detector
+            positions = routing_map.get(expert_idx, [])
+            if not positions:
+                continue
+
+            input_tensor = activation_data["input"].reshape(-1, activation_data["input"].shape[-1])
+            output_tensor = activation_data["output"].reshape(-1, activation_data["output"].shape[-1])
+            routed_inputs = input_tensor[positions]
+            routed_outputs = output_tensor[positions]
+
+            component_type = activation_data["component_type"]
+            module = activation_data["module"]
+
             expert_super_weights = self._find_expert_super_weights(
-                layer_idx, expert_idx, component_type, module,
-                input_tensor, output_tensor, spike_threshold, iteration
+                layer_idx,
+                expert_idx,
+                component_type,
+                module,
+                routed_inputs,
+                routed_outputs,
+                spike_threshold,
+                iteration,
             )
             super_weights.extend(expert_super_weights)
-        
-        return super_weights
-    
-    def _find_expert_super_weights(self, layer_idx: int, expert_idx: int, 
-                                 component_type: str, module, 
-                                 input_tensor, output_tensor, 
-                                 spike_threshold: float, iteration: int) -> List[MoESuperWeight]:
-        """Find super weights in a specific expert component"""
-        
-        super_weights = []
 
-        # Get the actual component name for this expert
-        component_name = self.mlp_handler.get_expert_component_name(layer_idx, expert_idx, component_type)
-        if not component_name:
-            self.logger.warning(f"Could not get component name for expert {expert_idx} in layer {layer_idx}")
-            return super_weights
-        
-        # Process tensors (similar to standard detector)
-        if len(input_tensor.shape) == 3:  # [batch, seq, hidden]
-            input_flat = input_tensor.reshape(-1)
-            abs_input = torch.abs(input_flat)
-            max_input_mag, max_input_idx = torch.max(abs_input, dim=0)
-            
-            if max_input_mag > spike_threshold:
-                # Find corresponding output spike
-                output_flat = output_tensor.reshape(-1)
-                abs_output = torch.abs(output_flat)
-                max_output_mag, max_output_idx = torch.max(abs_output, dim=0)
-                
-                if max_output_mag > spike_threshold:
-                    # Extract indices
-                    input_channel = max_input_idx.item() % input_tensor.shape[2]
-                    output_channel = max_output_idx.item() % output_tensor.shape[2]
-                    
-                    # Get actual values
-                    input_value = input_flat[max_input_idx].item()
-                    output_value = output_flat[max_output_idx].item()
-                    
-                    # Get original weight value
-                    original_value = module.weight.data[output_channel, input_channel].item()
-                    
-                    # Create MoESuperWeight
-                    super_weight = MoESuperWeight(
-                        layer=layer_idx,
-                        expert_id=expert_idx,
-                        component=component_name,
-                        row=output_channel,
-                        column=input_channel,
-                        input_value=input_value,
-                        output_value=output_value,
-                        iteration_found=iteration + 1,
-                        original_value=original_value
-                    )
-                    super_weights.append(super_weight)
-        
         return super_weights
+
+    def _find_expert_super_weights(
+        self,
+        layer_idx: int,
+        expert_idx: int,
+        component_type: str,
+        module,
+        input_tensor,
+        output_tensor,
+        spike_threshold: float,
+        iteration: int,
+    ) -> List[MoESuperWeight]:
+        """Find super weights in a specific expert component using co-spike scoring."""
+
+        super_weights: List[MoESuperWeight] = []
+
+        component_name = self.mlp_handler.get_expert_component_name(
+            layer_idx, expert_idx, component_type
+        )
+        if not component_name:
+            self.logger.warning(
+                f"Could not get component name for expert {expert_idx} in layer {layer_idx}"
+            )
+            return super_weights
+
+        if input_tensor.numel() == 0 or output_tensor.numel() == 0:
+            return super_weights
+
+        try:
+            r_star, c_star, score = self._argmax_co_spike(input_tensor, output_tensor)
+        except Exception as e:
+            self.logger.warning(f"Co-spike computation failed: {e}")
+            return super_weights
+
+        if score < self.co_spike_tau:
+            return super_weights
+
+        input_value = input_tensor[:, r_star].max().item()
+        output_value = output_tensor[:, c_star].max().item()
+        original_value = module.weight.data[c_star, r_star].item()
+
+        delta_energy, delta_stop = self._run_micro_ablation(
+            layer_idx, expert_idx, module, r_star, c_star, input_tensor, output_tensor
+        )
+
+        if not self._passes_proxy_thresholds(delta_energy, delta_stop):
+            return super_weights
+
+        layer_cache = self.expert_activation_cache.get(layer_idx, {})
+        p_active = layer_cache.get("p_active", {}).get(expert_idx)
+        low_entropy_positions = layer_cache.get("low_entropy_positions")
+        overflow = layer_cache.get("overflow")
+
+        I_nat = self._eval_weighted_metric(
+            layer_idx, expert_idx, module, r_star, c_star, p_active
+        )
+        I_int = self._eval_metric_with_routing_intervention(
+            layer_idx, expert_idx, module, r_star, c_star
+        )
+
+        sw = MoESuperWeight(
+            layer=layer_idx,
+            expert_id=expert_idx,
+            component=component_name,
+            row=c_star,
+            column=r_star,
+            input_value=input_value,
+            output_value=output_value,
+            iteration_found=iteration + 1,
+            original_value=original_value,
+            score_co_spike=score,
+            p_active=p_active,
+            low_entropy_positions=low_entropy_positions,
+            capacity_overflow_rate=overflow,
+            proxies={"energy": delta_energy, "stop": delta_stop},
+            I_nat=I_nat,
+            I_int=I_int,
+        )
+        super_weights.append(sw)
+
+        return super_weights
+
+    # ------------------------------------------------------------------
+    # Helper utilities for upgraded MoE detection
+
+    def _argmax_co_spike(self, X: torch.Tensor, Y: torch.Tensor, eps: float = 1e-8):
+        """Compute co-spike score matrix and return argmax indices and score."""
+
+        # Flatten batch dimension if present
+        if X.dim() == 3:
+            X_flat = X.reshape(-1, X.shape[-1])
+            Y_flat = Y.reshape(-1, Y.shape[-1])
+        else:
+            X_flat, Y_flat = X, Y
+
+        x_norm = torch.sqrt((X_flat ** 2).sum(0) + eps)
+        y_norm = torch.sqrt((Y_flat ** 2).sum(0) + eps)
+        score_matrix = torch.abs(X_flat.T @ Y_flat) / (x_norm[:, None] * y_norm[None, :])
+        max_idx = torch.argmax(score_matrix)
+        r_star = int(max_idx // score_matrix.shape[1])
+        c_star = int(max_idx % score_matrix.shape[1])
+        score = score_matrix[r_star, c_star].item()
+        return r_star, c_star, score
+
+    def _run_micro_ablation(
+        self,
+        layer_idx: int,
+        expert_idx: int,
+        module,
+        r_star: int,
+        c_star: int,
+        input_tensor: torch.Tensor,
+        output_tensor: torch.Tensor,
+    ) -> Tuple[float, float]:
+        """Compute micro-ablation proxies for a candidate weight."""
+
+        # Baseline energy
+        baseline_energy = (output_tensor[:, c_star] ** 2).mean().item()
+
+        original_val = module.weight.data[c_star, r_star].item()
+        try:
+            module.weight.data[c_star, r_star] = 0.0
+            with torch.no_grad():
+                # Recompute output for ablated weight using stored input
+                ablated_output = input_tensor @ module.weight.T
+                ablated_energy = (ablated_output[:, c_star] ** 2).mean().item()
+        finally:
+            module.weight.data[c_star, r_star] = original_val
+
+        delta_energy = ablated_energy - baseline_energy
+
+        # Simple stopword proxy: placeholder using tokenizer to decode probabilities
+        delta_stop = 0.0
+        try:
+            stop_ids = getattr(self.tokenizer, "stop_token_ids", [])
+            if stop_ids:
+                baseline_logits = output_tensor
+                ablated_logits = ablated_output
+                baseline_probs = torch.softmax(baseline_logits, dim=-1)
+                ablated_probs = torch.softmax(ablated_logits, dim=-1)
+                baseline_mass = baseline_probs[:, stop_ids].sum().item()
+                ablated_mass = ablated_probs[:, stop_ids].sum().item()
+                delta_stop = ablated_mass - baseline_mass
+        except Exception:
+            pass
+
+        return delta_energy, delta_stop
+
+    def _passes_proxy_thresholds(self, delta_energy: float, delta_stop: float) -> bool:
+        """Basic thresholding for proxy metrics."""
+
+        energy_drop_ok = delta_energy < -0.05 * abs(delta_energy)
+        # stopword skew can be any sign; require magnitude above small threshold
+        stop_ok = abs(delta_stop) > 0.01
+        return energy_drop_ok and stop_ok
+
+    def _eval_weighted_metric(
+        self,
+        layer_idx: int,
+        expert_idx: int,
+        module,
+        r_star: int,
+        c_star: int,
+        p_active: Optional[float],
+    ) -> float:
+        """Placeholder for routing-aware metric evaluation."""
+
+        if p_active is None:
+            return 0.0
+        # simple proxy: scaled by magnitude of weight
+        weight_val = module.weight.data[c_star, r_star].item()
+        return p_active * abs(weight_val)
+
+    def _eval_metric_with_routing_intervention(
+        self,
+        layer_idx: int,
+        expert_idx: int,
+        module,
+        r_star: int,
+        c_star: int,
+    ) -> float:
+        """Placeholder for interventional routing metric."""
+
+        weight_val = module.weight.data[c_star, r_star].item()
+        return abs(weight_val) * 0.1

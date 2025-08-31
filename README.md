@@ -35,7 +35,8 @@ from research.researcher import SuperWeightResearchSession
 session = SuperWeightResearchSession.from_model_name('allenai/OLMo-1B-0724-hf')
 
 # Detect super weights
-super_weights = session.detect_super_weights(spike_threshold=70.0)
+# For MoE models you can optionally control router analysis samples
+super_weights = session.detect_super_weights(spike_threshold=70.0, router_analysis_samples=5)
 print(f"Found {len(super_weights)} super weights")
 
 # Analyze vocabulary effects
@@ -131,7 +132,8 @@ session = SuperWeightResearchSession.from_model_name('mistralai/Mistral-7B-v0.1'
 super_weights = session.detect_super_weights(
     input_text="Apple Inc. is a worldwide tech company.",
     spike_threshold=50.0,
-    max_iterations=10
+    max_iterations=10,
+    router_analysis_samples=5  # Only used for MoE models
 )
 
 # Quick screening to find most impactful super weights
@@ -254,7 +256,7 @@ print("Attack vectors:", math_analysis['attack_vectors'])
 ## 🎯 Goals and Future Work
 
 ### 🔮 **Planned Extensions**
-- **Mixture of Experts**: Support for Mixtral, OLMoE, DeepSeek-MoE, Qwen-MoE models
+- **Mixture of Experts**: Support for Mixtral, OLMoE, DeepSeek-MoE, Qwen-MoE models. See [MOE_SUPER_WEIGHT_MIGRATION.md](MOE_SUPER_WEIGHT_MIGRATION.md) for the routing-aware migration guide.
 - **Cross-Model Analysis**: Comparative studies across different architectures
 - **Intervention Strategies**: Advanced techniques for super weight manipulation
 - **Theoretical Analysis**: Mathematical frameworks for understanding super weights
