@@ -8,7 +8,7 @@ It provides functionality similar to the validation notebook but in an automated
 Features:
 - Detect super weights with configurable parameters
 - Analyze perplexity impact on WikiText
-- Measure accuracy impact on MMLU, HellaSwag, and ARC
+- Measure accuracy impact on HellaSwag, GSM8K and ARC
 - Test individual and combined super weight effects
 - Generate comprehensive reports and visualizations
 - Save results in organized JSON format
@@ -416,7 +416,7 @@ class SuperWeightAnalysisRunner:
             self.logger.info("Skipping perplexity analysis (disabled)")
         
         # Accuracy analysis on multiple tasks
-        accuracy_tasks = config.get('accuracy_tasks', ['hellaswag', 'arc_easy', 'mmlu'])
+        accuracy_tasks = config.get('accuracy_tasks', ['hellaswag', 'arc_easy'])
         analysis['accuracy_impacts'] = {}
         
         self.logger.info(f"Running accuracy analysis on {len(accuracy_tasks)} tasks: {accuracy_tasks}")
@@ -424,35 +424,16 @@ class SuperWeightAnalysisRunner:
         # Use tqdm for task progress
         for task in tqdm(accuracy_tasks, desc="Accuracy tasks", leave=False):
             try:
-                if task == 'mmlu':
-                    # Test multiple MMLU subjects
-                    mmlu_subjects = config.get('mmlu_subjects', ['abstract_algebra', 'anatomy', 'business_ethics'])
-                    self.logger.info(f"Testing {len(mmlu_subjects)} MMLU subjects: {mmlu_subjects}")
-                    mmlu_results = {}
-                    
-                    # Use tqdm for MMLU subjects
-                    for subject in tqdm(mmlu_subjects, desc="MMLU subjects", leave=False):
-                        accuracy_result = self._measure_mmlu_accuracy(
-                            session, super_weight, subject, config.get('accuracy_samples', 100)
-                        )
-                        mmlu_results[subject] = accuracy_result
-                        if 'error' not in accuracy_result:
-                            self.logger.info(f"{subject}: accuracy drop {accuracy_result.get('accuracy_drop', 0):.3f}")
-                        else:
-                            self.logger.warning(f"{subject}: {accuracy_result['error']}")
-                    analysis['accuracy_impacts']['mmlu'] = mmlu_results
-                    self.logger.info(f"MMLU analysis complete")
+                accuracy_result = session.analyzer.metrics_analyzer.measure_accuracy_impact(
+                    super_weight,
+                    task=task,
+                    n_samples=config.get('accuracy_samples', 100)
+                )
+                analysis['accuracy_impacts'][task] = accuracy_result
+                if 'error' not in accuracy_result:
+                    self.logger.info(f"{task}: accuracy drop {accuracy_result.get('accuracy_drop', 0):.3f}")
                 else:
-                    accuracy_result = session.analyzer.metrics_analyzer.measure_accuracy_impact(
-                        super_weight,
-                        task=task,
-                        n_samples=config.get('accuracy_samples', 100)
-                    )
-                    analysis['accuracy_impacts'][task] = accuracy_result
-                    if 'error' not in accuracy_result:
-                        self.logger.info(f"{task}: accuracy drop {accuracy_result.get('accuracy_drop', 0):.3f}")
-                    else:
-                        self.logger.warning(f"{task}: {accuracy_result['error']}")
+                    self.logger.warning(f"{task}: {accuracy_result['error']}")
                     
             except Exception as e:
                 self.logger.warning(f"Accuracy analysis failed for {super_weight} on {task}: {e}")
@@ -460,87 +441,6 @@ class SuperWeightAnalysisRunner:
         
         self.logger.info(f"Individual analysis complete for {super_weight}")
         return analysis
-    
-    def _measure_mmlu_accuracy(self, 
-                             session: SuperWeightResearchSession,
-                             super_weight: SuperWeight,
-                             subject: str,
-                             n_samples: int) -> Dict[str, Any]:
-        """Measure MMLU accuracy for a specific subject"""
-        
-        # Load MMLU data
-        mmlu_data = self.dataset_loader.load_mmlu(subject=subject, n_samples=n_samples)
-        
-        if not mmlu_data:
-            return {'error': f'Could not load MMLU data for subject {subject}'}
-        
-        # Compute baseline accuracy
-        baseline_correct = 0
-        modified_correct = 0
-        total = 0
-        
-        # Use tqdm for MMLU sample processing
-        for example in tqdm(mmlu_data, desc=f"MMLU {subject}", leave=False):
-            try:
-                # Baseline prediction
-                baseline_pred = self._predict_mmlu(session, example)
-                if baseline_pred == example['label']:
-                    baseline_correct += 1
-                
-                # Modified prediction (with super weight zeroed)
-                with session.manager.temporary_zero([super_weight]):
-                    modified_pred = self._predict_mmlu(session, example)
-                    if modified_pred == example['label']:
-                        modified_correct += 1
-                
-                total += 1
-                
-            except Exception as e:
-                self.logger.debug(f"Skipped MMLU example due to error: {e}")
-                continue
-        
-        if total == 0:
-            return {'error': 'No valid examples processed'}
-        
-        baseline_accuracy = baseline_correct / total
-        modified_accuracy = modified_correct / total
-        accuracy_drop = baseline_accuracy - modified_accuracy
-        
-        return {
-            'subject': subject,
-            'baseline_accuracy': baseline_accuracy,
-            'modified_accuracy': modified_accuracy,
-            'accuracy_drop': accuracy_drop,
-            'accuracy_ratio': modified_accuracy / baseline_accuracy if baseline_accuracy > 0 else 0.0,
-            'n_samples': total,
-            'impact_severity': self._classify_accuracy_impact(accuracy_drop)
-        }
-    
-    def _predict_mmlu(self, session: SuperWeightResearchSession, example: Dict) -> int:
-        """Predict MMLU answer"""
-        question = example['question']
-        choices = example['choices']
-        
-        best_score = float('-inf')
-        best_idx = 0
-        
-        for i, choice in enumerate(choices):
-            # Create question-answer format
-            qa_text = f"Question: {question}\n\nChoices:\nA. {choices[0]}\nB. {choices[1]}\nC. {choices[2]}\nD. {choices[3]}\n\nAnswer: {choice}"
-            
-            # Tokenize
-            tokens = session.tokenizer(qa_text, return_tensors='pt', truncation=True, max_length=512).to(session.model.device)
-            
-            # Compute log probability
-            with torch.no_grad():
-                outputs = session.model(**tokens, labels=tokens['input_ids'])
-                log_prob = -outputs.loss.item()
-                
-                if log_prob > best_score:
-                    best_score = log_prob
-                    best_idx = i
-        
-        return best_idx
     
     def _classify_accuracy_impact(self, accuracy_drop: float) -> str:
         """Classify the severity of accuracy impact"""
@@ -593,31 +493,16 @@ class SuperWeightAnalysisRunner:
         # Use tqdm for combined accuracy tasks
         for task in tqdm(accuracy_tasks, desc="Combined accuracy tasks", leave=False):
             try:
-                if task == 'mmlu':
-                    # Average across multiple subjects for combined analysis
-                    mmlu_subjects = config.get('mmlu_subjects', ['abstract_algebra', 'anatomy', 'business_ethics'])
-                    self.logger.info(f"Testing combined effect on MMLU (averaging across subjects)")
-                    combined_accuracy_result = session.analyzer.metrics_analyzer.measure_accuracy_impact(
-                        super_weights,
-                        task=task,
-                        n_samples=config.get('accuracy_samples', 100)
-                    )
-                    analysis['combined_accuracy_impacts']['mmlu'] = combined_accuracy_result
-                    if 'error' not in combined_accuracy_result:
-                        self.logger.info(f"Combined MMLU: accuracy drop {combined_accuracy_result.get('accuracy_drop', 0):.3f}")
-                    else:
-                        self.logger.warning(f"Combined MMLU: {combined_accuracy_result['error']}")
+                accuracy_result = session.analyzer.metrics_analyzer.measure_accuracy_impact(
+                    super_weights,
+                    task=task,
+                    n_samples=config.get('accuracy_samples', 100)
+                )
+                analysis['combined_accuracy_impacts'][task] = accuracy_result
+                if 'error' not in accuracy_result:
+                    self.logger.info(f"{task}: accuracy drop {accuracy_result.get('accuracy_drop', 0):.3f}")
                 else:
-                    accuracy_result = session.analyzer.metrics_analyzer.measure_accuracy_impact(
-                        super_weights,
-                        task=task,
-                        n_samples=config.get('accuracy_samples', 100)
-                    )
-                    analysis['combined_accuracy_impacts'][task] = accuracy_result
-                    if 'error' not in accuracy_result:
-                        self.logger.info(f"{task}: accuracy drop {accuracy_result.get('accuracy_drop', 0):.3f}")
-                    else:
-                        self.logger.warning(f"{task}: {accuracy_result['error']}")
+                    self.logger.warning(f"{task}: {accuracy_result['error']}")
                     
             except Exception as e:
                 self.logger.warning(f"Combined accuracy analysis failed for {task}: {e}")
@@ -885,20 +770,6 @@ class SuperWeightAnalysisRunner:
                         'baseline': result['baseline_accuracy'],
                         'combined': result['modified_accuracy']
                     }
-                elif isinstance(result, dict) and task == 'mmlu':
-                    # Handle MMLU results (average across subjects)
-                    baseline_accs = []
-                    modified_accs = []
-                    for subject_result in result.values():
-                        if isinstance(subject_result, dict) and 'baseline_accuracy' in subject_result:
-                            baseline_accs.append(subject_result['baseline_accuracy'])
-                            modified_accs.append(subject_result['modified_accuracy'])
-                    
-                    if baseline_accs:
-                        accuracy_data[task] = {
-                            'baseline': np.mean(baseline_accs),
-                            'combined': np.mean(modified_accs)
-                        }
         
         # Determine subplot layout
         num_plots = (1 if perplexity_baseline is not None else 0) + (1 if accuracy_data else 0)
@@ -997,21 +868,6 @@ class SuperWeightAnalysisRunner:
                             accuracy_data[task]['baseline'] = result['baseline_accuracy']
                         accuracy_data[task]['super_weights'].append(result['modified_accuracy'])
                         accuracy_data[task]['sw_labels'].append(sw_id)
-                    elif isinstance(result, dict) and task == 'mmlu':
-                        # Handle MMLU results (average across subjects)
-                        baseline_accs = []
-                        modified_accs = []
-                        for subject_result in result.values():
-                            if isinstance(subject_result, dict) and 'baseline_accuracy' in subject_result:
-                                baseline_accs.append(subject_result['baseline_accuracy'])
-                                modified_accs.append(subject_result['modified_accuracy'])
-                        
-                        if baseline_accs:
-                            # Store baseline only once per task
-                            if accuracy_data[task]['baseline'] is None:
-                                accuracy_data[task]['baseline'] = np.mean(baseline_accs)
-                            accuracy_data[task]['super_weights'].append(np.mean(modified_accs))
-                            accuracy_data[task]['sw_labels'].append(sw_id)
         
         # Determine subplot layout
         num_plots = (1 if perplexity_data['baseline'] is not None else 0) + len(accuracy_data)
@@ -1395,15 +1251,8 @@ def parse_arguments():
     parser.add_argument(
         '--accuracy-tasks',
         nargs='+',
-        default=['hellaswag', 'arc_easy', 'mmlu', 'gsm8k'],
+        default=['hellaswag', 'arc_easy', 'gsm8k'],
         help='Accuracy tasks to evaluate'
-    )
-    
-    parser.add_argument(
-        '--mmlu-subjects',
-        nargs='+',
-        default=['abstract_algebra', 'anatomy', 'business_ethics', 'clinical_knowledge', 'college_mathematics'],
-        help='MMLU subjects to test'
     )
     
     # Output configuration
@@ -1491,8 +1340,7 @@ def main():
         'accuracy_analysis': not args.skip_accuracy,
         'perplexity_samples': args.perplexity_samples,
         'accuracy_samples': args.accuracy_samples,
-        'accuracy_tasks': args.accuracy_tasks,
-        'mmlu_subjects': args.mmlu_subjects
+        'accuracy_tasks': args.accuracy_tasks
     }
     
     # Run analysis
