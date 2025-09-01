@@ -57,10 +57,12 @@ A specialized vocabulary analysis script that provides detailed analysis of voca
 **Features:**
 - Analyze neuron vocabulary effects with optional cosine similarity
 - Measure interventional impacts on loss, entropy, top-k margin, stopword mass
+- **Dual token analysis**: Both neuron vocabulary effects AND interventional token probability changes
 - Generate cascade effect analysis across layers
 - Token class enrichment analysis (digits, parentheses, function words, etc.)
 - Control experiments for validation (random coordinates, full neuron ablation)
 - Bootstrap confidence intervals
+- **Smart token validation**: Automatic validation and recommendations for token/window parameters
 - Machine-readable JSONL output format
 - Reproducible results with fixed seeds
 - GPU-aware memory management
@@ -307,10 +309,12 @@ python scripts/run_vocab_analyses.py \
 
 ### Use `run_vocab_analyses.py` when:
 - You want **detailed vocabulary effect analysis** (neuron-level vocabulary impacts)
+- You need **dual token analysis** (both vocabulary effects AND interventional probability changes)
 - You need **interventional analysis** with sliding window evaluation
 - You want **cascade effect analysis** across transformer layers
 - You need **token class enrichment** analysis (digits, parentheses, function words)
 - You want **control experiments** (random coordinates, full neuron ablation)
+- You need **smart token validation** with automatic parameter recommendations
 - You prefer **JSONL output** with CSV summaries for easy data analysis
 - You're doing **mechanistic interpretability research** on vocabulary effects
 
