@@ -147,13 +147,29 @@ class SuperWeightAnalysisRunner:
         for model_name in tqdm(model_names, desc="Analyzing models"):
             self.logger.info(f"Analyzing model: {model_name}")
             
+            # Create model-specific detection configuration
+            model_detection_config = detection_config.copy()
+            
+            # Set model-specific spike threshold
+            model_specific_threshold = self._get_model_specific_spike_threshold(
+                model_name, 
+                detection_config.get('spike_threshold')
+            )
+            model_detection_config['spike_threshold'] = model_specific_threshold
+            
+            # Log the threshold being used
+            if detection_config.get('spike_threshold') is not None:
+                self.logger.info(f"Using user-specified spike threshold: {model_specific_threshold}")
+            else:
+                self.logger.info(f"Using model-specific spike threshold for {model_name}: {model_specific_threshold}")
+            
             # Setup model-specific logging early
             self._setup_model_directories(model_name)
             self.logger = self._setup_logger(model_name)
             
             try:
                 model_results = self._analyze_single_model(
-                    model_name, detection_config, evaluation_config
+                    model_name, model_detection_config, evaluation_config
                 )
                 all_results['model_results'][model_name] = model_results
                 
@@ -189,6 +205,10 @@ class SuperWeightAnalysisRunner:
                             evaluation_config: Dict[str, Any]) -> Dict[str, Any]:
         """Analyze a single model"""
         
+        # Log initial GPU state
+        self._log_gpu_memory(f"before loading {model_name}")
+        self._reset_gpu_memory_stats()
+        
         # Setup model-specific directories first
         model_dir = self._setup_model_directories(model_name)
         
@@ -208,6 +228,9 @@ class SuperWeightAnalysisRunner:
                 model_kwargs={'trust_remote_code': True, 'device_map': 'auto', 'torch_dtype': torch.float16}
             )
             model_results['model_info'] = session.model_info
+            
+            # Log GPU usage after model loading
+            self._log_gpu_memory(f"after loading {model_name}")
             
         except Exception as e:
             self.logger.error(f"Failed to load model {model_name}: {e}")
@@ -281,15 +304,39 @@ class SuperWeightAnalysisRunner:
                 self._save_model_results(model_name, model_results)
             except Exception as save_error:
                 self.logger.error(f"Failed to save error results for {model_name}: {save_error}")
-        
+    
         finally:
-            # Cleanup
+            # Enhanced GPU cleanup
             try:
                 if 'session' in locals():
+                    # Clear model and tokenizer references
+                    if hasattr(session, 'model'):
+                        del session.model
+                    if hasattr(session, 'tokenizer'):
+                        del session.tokenizer
+                    if hasattr(session, 'detector'):
+                        del session.detector
+                    if hasattr(session, 'manager'):
+                        del session.manager
+                    if hasattr(session, 'analyzer'):
+                        del session.analyzer
                     del session
-                torch.cuda.empty_cache()
-            except:
-                pass
+                
+                # Force garbage collection
+                import gc
+                gc.collect()
+                
+                # Clear GPU cache multiple times for thorough cleanup
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()  # Wait for all operations to complete
+                    torch.cuda.empty_cache()  # Second cleanup after sync
+                
+                # Log final GPU state
+                self._log_gpu_memory(f"after cleanup {model_name}")
+                
+            except Exception as cleanup_error:
+                self.logger.warning(f"GPU cleanup warning: {cleanup_error}")
         
         return model_results
     
@@ -590,8 +637,7 @@ class SuperWeightAnalysisRunner:
         
         analysis = {
             'models_analyzed': list(successful_models.keys()),
-            'summary_statistics': self._compute_cross_model_statistics(successful_models),
-            'comparative_analysis': self._compute_comparative_analysis(successful_models)
+            'summary_statistics': self._compute_cross_model_statistics(successful_models)
         }
         
         return analysis
@@ -638,20 +684,6 @@ class SuperWeightAnalysisRunner:
         
         return stats
     
-    def _compute_comparative_analysis(self, model_results: Dict[str, Dict]) -> Dict[str, Any]:
-        """Compare models on key metrics"""
-        
-        comparison = {
-            'super_weight_density': {},  # Super weights per parameter
-            'impact_rankings': {},
-            'architecture_differences': {}
-        }
-        
-        # TODO: Implement detailed comparative analysis
-        # This would include comparing super weight patterns, impact severity, etc.
-        
-        return comparison
-    
     def _generate_model_plots(self, model_name: str, results: Dict[str, Any]):
         """Generate plots for a single model using the model-specific plots directory"""
         
@@ -665,6 +697,9 @@ class SuperWeightAnalysisRunner:
         else:
             plots_dir = self._current_model_plots_dir
         
+        # Generate timestamp for plot filenames
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
         try:
             # 1. Detection iterations plot
             if 'detection_results' in results:
@@ -673,7 +708,7 @@ class SuperWeightAnalysisRunner:
                 if iteration_data:
                     self._plot_detection_iterations(
                         iteration_data,
-                        plots_dir / 'detection_iterations.png',
+                        plots_dir / f'detection_iterations_{timestamp}.png',
                         spike_threshold=spike_threshold
                     )
                 else:
@@ -685,28 +720,28 @@ class SuperWeightAnalysisRunner:
                 if super_weights:
                     self._plot_super_weight_distribution(
                         super_weights,
-                        plots_dir / 'super_weight_distribution.png'
+                        plots_dir / f'super_weight_distribution_{timestamp}.png'
                     )
             
             # 3. Impact comparison
             if 'individual_analyses' in results:
                 self._plot_impact_comparison(
                     results['individual_analyses'],
-                    plots_dir / 'impact_comparison.png'
+                    plots_dir / f'impact_comparison_{timestamp}.png'
                 )
             
             # 4. Combined analysis plot
             if 'combined_analysis' in results:
                 self._plot_combined_analysis(
                     results['combined_analysis'],
-                    plots_dir / 'combined_analysis.png'
+                    plots_dir / f'combined_analysis_{timestamp}.png'
                 )
             
             # 5. MoE-specific plots if applicable
             if 'detection_results' in results and any('expert_id' in sw for sw in results['detection_results']['super_weights']):
                 self._plot_moe_analysis(
                     results['detection_results']['super_weights'],
-                    plots_dir / 'moe_analysis.png'
+                    plots_dir / f'moe_analysis_{timestamp}.png'
                 )
             
             self.logger.info(f"Plots generated for {model_name} in {plots_dir}")
@@ -1167,7 +1202,8 @@ class SuperWeightAnalysisRunner:
             ax2.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig(summary_plots_dir / 'model_comparison.png', dpi=300, bbox_inches='tight')
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        plt.savefig(summary_plots_dir / f'model_comparison_{timestamp}.png', dpi=300, bbox_inches='tight')
         plt.close()
         
         self.logger.info(f"Summary plots saved to {summary_plots_dir}")
@@ -1238,6 +1274,54 @@ class SuperWeightAnalysisRunner:
         self._current_model_plots_dir = plots_dir
         
         self.logger.info(f"All results successfully saved for {model_name} in {model_dir}")
+    
+    def _get_model_specific_spike_threshold(self, model_name: str, user_threshold: Optional[float] = None) -> float:
+        """Get model-specific spike threshold based on model architecture"""
+        
+        # If user provided a threshold, use it
+        if user_threshold is not None:
+            return user_threshold
+        
+        # Model-specific thresholds based on architecture
+        model_thresholds = {
+            'llama': 120.0,
+            'phi': 250.0,
+            'olmo': 70.0,
+            'mistral': 100.0
+        }
+        
+        # Default threshold
+        default_threshold = 50.0
+        
+        # Parse model name to determine architecture
+        model_lower = model_name.lower()
+        
+        for arch_name, threshold in model_thresholds.items():
+            if arch_name in model_lower:
+                return threshold
+        
+        # Return default if no match found
+        return default_threshold
+    
+    def _log_gpu_memory(self, context: str = ""):
+        """Log current GPU memory usage"""
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / (1024**3)  # GB
+            reserved = torch.cuda.memory_reserved() / (1024**3)   # GB
+            max_allocated = torch.cuda.max_memory_allocated() / (1024**3)  # GB
+            
+            self.logger.info(f"GPU Memory {context}: "
+                            f"Allocated: {allocated:.2f}GB, "
+                            f"Reserved: {reserved:.2f}GB, "
+                            f"Max Allocated: {max_allocated:.2f}GB")
+        else:
+            self.logger.debug(f"GPU Memory {context}: CUDA not available")
+
+    def _reset_gpu_memory_stats(self):
+        """Reset GPU memory statistics"""
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.reset_accumulated_memory_stats()
 
 
 def parse_arguments():
@@ -1260,8 +1344,9 @@ def parse_arguments():
     parser.add_argument(
         '--spike-threshold', '-t',
         type=float,
-        default=50.0,
-        help='Spike threshold for super weight detection'
+        default=None,
+        help='Spike threshold for super weight detection. If not provided, uses model-specific defaults: '
+             'Llama models (120), Phi models (250), OLMo models (70), Mistral models (100), Others (50)'
     )
     
     parser.add_argument(
@@ -1392,7 +1477,7 @@ def main():
 
     # Prepare detection configuration
     detection_config = {
-        'spike_threshold': args.spike_threshold,
+        'spike_threshold': args.spike_threshold,  # Will be None if not specified by user
         'max_iterations': args.max_iterations,
         'router_analysis_samples': args.router_analysis_samples,
         'p_active_floor': args.p_active_floor,

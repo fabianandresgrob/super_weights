@@ -155,12 +155,6 @@ class SuperWeightDetector(BaseSuperWeightDetector):
             for iteration in range(max_iterations):
                 self.logger.info(f"=== Iteration {iteration + 1} ===")
 
-                # Assert for each already detected super weight, that it's weight is set to 0
-                for sw in detected_super_weights:
-                    base, down_name, module = self._get_mlp_component_info(sw.layer)
-                    current_weight = module.weight[sw.row, sw.column].item()
-                    assert current_weight == 0, f"Super weight {sw} is not zeroed out."
-
                 # Detect super weights in this iteration
                 new_super_weights = self._detect_single_iteration(
                     input_tokens, spike_threshold, iteration
@@ -181,7 +175,7 @@ class SuperWeightDetector(BaseSuperWeightDetector):
                 detected_super_weights.extend(unique_super_weights)
                 
                 # Zero out detected weights for next iteration
-                if zero_detected_weights and iteration < max_iterations - 1:  # Don't zero on last iteration
+                if zero_detected_weights and iteration < max_iterations:
                     self.logger.info(f"Zeroing {len(unique_super_weights)} detected super weights...")
                     success = self.manager.zero_super_weights(unique_super_weights)
                     if not success:
@@ -1483,7 +1477,9 @@ class MoESuperWeightDetector(BaseSuperWeightDetector):
         # Phase 1: Handle regular MLP layers (before MoE layers)
         if moe_start_layer > 0:
             self.logger.info(f"Phase 1: Detecting super weights in regular MLP layers (0 to {moe_start_layer-1})")
-            regular_detector = SuperWeightDetector(self.model, self.tokenizer, self.mlp_handler)
+            # Create manager
+            regular_manager = SuperWeightManager(self.model, self.mlp_handler)
+            regular_detector = SuperWeightDetector(self.model, self.tokenizer, self.mlp_handler, regular_manager)
             
             # Temporarily limit the detector to only regular layers
             original_layers = regular_detector.layers
