@@ -6,6 +6,7 @@ from collections import defaultdict
 
 from .super_weight import SuperWeight, MoESuperWeight
 from utils.model_architectures import UniversalMLPHandler
+from management.manager import SuperWeightManager
 
 
 class BaseSuperWeightDetector:
@@ -68,8 +69,19 @@ class SuperWeightDetector(BaseSuperWeightDetector):
     Focuses on down/output projection components in MLP layers.
     """
     
-    def __init__(self, model, tokenizer, mlp_handler: UniversalMLPHandler, log_level=logging.INFO):
+    def __init__(self, model, tokenizer, mlp_handler: UniversalMLPHandler, 
+                 manager: SuperWeightManager, log_level=logging.INFO):
         super().__init__(model, tokenizer, mlp_handler, log_level)
+
+        # Initialize or use provided manager
+        if manager is None:
+            self.manager = SuperWeightManager(model, mlp_handler, log_level)
+            self.owns_manager = True
+        else:
+            self.manager = manager
+            self.owns_manager = False
+        
+        self.logger.info("SuperWeightDetector initialized with manager integration")
     
     def _get_mlp_component_info(self, layer_idx: int) -> Tuple[str, str, torch.nn.Module]:
         """Get MLP component information for a layer using universal handler"""
@@ -111,7 +123,8 @@ class SuperWeightDetector(BaseSuperWeightDetector):
     def detect_super_weights(self, 
                            input_text: str = "Apple Inc. is a worldwide tech company.",
                            spike_threshold: float = 50.0,
-                           max_iterations: int = 10) -> List[SuperWeight]:
+                           max_iterations: int = 10,
+                           zero_detected_weights: bool = True) -> List[SuperWeight]:
         """
         Main method to detect super weights using iterative removal.
         
@@ -119,12 +132,14 @@ class SuperWeightDetector(BaseSuperWeightDetector):
             input_text: Text to use for detection
             spike_threshold: Threshold for detecting activation spikes
             max_iterations: Maximum number of iterations
+            zero_detected_weights: Whether to zero out detected weights between iterations
             
         Returns:
             List of detected super weights
         """
         self.logger.info("Starting super weight detection")
         self.logger.info(f"Parameters: threshold={spike_threshold}, max_iterations={max_iterations}")
+        self.logger.info(f"Zero detected weights: {zero_detected_weights}")
         
         # Reset state
         self._reset_detection_state()
@@ -135,44 +150,67 @@ class SuperWeightDetector(BaseSuperWeightDetector):
         detected_super_weights = []
         processed_coordinates = set()
         
-        # Iterative detection
-        for iteration in range(max_iterations):
-            self.logger.info(f"=== Iteration {iteration + 1} ===")
+        try:
+            # Iterative detection
+            for iteration in range(max_iterations):
+                self.logger.info(f"=== Iteration {iteration + 1} ===")
+
+                # Assert for each already detected super weight, that it's weight is set to 0
+                for sw in detected_super_weights:
+                    base, down_name, module = self._get_mlp_component_info(sw.layer)
+                    current_weight = module.weight[sw.row, sw.column].item()
+                    assert current_weight == 0, f"Super weight {sw} is not zeroed out."
+
+                # Detect super weights in this iteration
+                new_super_weights = self._detect_single_iteration(
+                    input_tokens, spike_threshold, iteration
+                )
+                
+                # Filter out duplicates based on coordinates
+                unique_super_weights = []
+                for sw in new_super_weights:
+                    if sw.weight_key not in processed_coordinates:
+                        unique_super_weights.append(sw)
+                        processed_coordinates.add(sw.weight_key)
+                
+                if not unique_super_weights:
+                    self.logger.info("No new super weights found. Stopping detection.")
+                    break
+                
+                # Add to detected list
+                detected_super_weights.extend(unique_super_weights)
+                
+                # Zero out detected weights for next iteration
+                if zero_detected_weights and iteration < max_iterations - 1:  # Don't zero on last iteration
+                    self.logger.info(f"Zeroing {len(unique_super_weights)} detected super weights...")
+                    success = self.manager.zero_super_weights(unique_super_weights)
+                    if not success:
+                        self.logger.warning("Some weights could not be zeroed. Detection may be affected.")
+                
+                # Log results for this iteration
+                self.logger.info(f"Found {len(unique_super_weights)} new super weights:")
+                for i, sw in enumerate(unique_super_weights):
+                    self.logger.info(f"  {i+1}. {sw} - Input: {sw.input_value:.2f}, Output: {sw.output_value:.2f}")
             
-            # Detect super weights in this iteration
-            new_super_weights, activation_data = self._detect_single_iteration(
-                input_tokens, spike_threshold, iteration
-            )
+            # Log final results
+            self._log_final_results(detected_super_weights)
             
-            # Filter out duplicates based on coordinates
-            unique_super_weights = []
-            for sw in new_super_weights:
-                if sw.weight_key not in processed_coordinates:
-                    unique_super_weights.append(sw)
-                    processed_coordinates.add(sw.weight_key)
+            return detected_super_weights
             
-            if not unique_super_weights:
-                self.logger.info("No new super weights found. Stopping detection.")
-                break
-            
-            # Add to detected list
-            detected_super_weights.extend(unique_super_weights)
-            
-            # Log results for this iteration
-            self.logger.info(f"Found {len(unique_super_weights)} new super weights:")
-            for i, sw in enumerate(unique_super_weights):
-                self.logger.info(f"  {i+1}. {sw} - Input: {sw.input_value:.2f}, Output: {sw.output_value:.2f}")
-            
-            # Check termination condition
-            max_output_mag = max(abs(val) for val in activation_data['max_output_values'])
-            if max_output_mag < spike_threshold:
-                self.logger.info(f"Maximum output magnitude ({max_output_mag:.2f}) below threshold. Stopping.")
-                break
-        
-        # Log final results
-        self._log_final_results(detected_super_weights)
-        
-        return detected_super_weights
+        finally:
+            # Always restore weights when detection is complete
+            if zero_detected_weights and detected_super_weights:
+                self.logger.info("Restoring all modified weights...")
+                self.manager.restore_super_weights(detected_super_weights)
+    
+    def __enter__(self):
+        """Context manager support"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager cleanup"""
+        if self.owns_manager:
+            self.manager.restore_all()
 
     def _safely_get_weight_column(self, module, h_input: int, device):
         """Safely get weight column, handling device mapping"""
@@ -246,7 +284,6 @@ class SuperWeightDetector(BaseSuperWeightDetector):
 
         # Register hooks
         for layer_idx in range(self.num_layers):
-            layer = self.layers[layer_idx]
             base, down_name, module = self._get_mlp_component_info(layer_idx)
             pre_hook = module.register_forward_pre_hook(create_pre_hook(layer_idx))
             post_hook = module.register_forward_hook(create_post_hook(layer_idx, base, down_name))
@@ -293,7 +330,7 @@ class SuperWeightDetector(BaseSuperWeightDetector):
         
         self.logger.info(f"Found {len(super_weights)} potential super weights in iteration {iteration + 1}")
         
-        return super_weights, activation_data
+        return super_weights
     
     def _log_final_results(self, detected_super_weights: List[SuperWeight]):
         """Log final detection results"""

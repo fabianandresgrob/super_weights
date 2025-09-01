@@ -27,12 +27,12 @@ class SuperWeightResearchSession:
         # Analyze architecture once
         self.model_info = self._analyze_model_architecture()
         
-        # Create appropriate detector based on architecture
-        self.detector = self._create_detector(log_level)
-        
         # Initialize other components with shared handler
         self.manager = SuperWeightManager(model, self.mlp_handler, log_level)  # Pass handler
         self.analyzer = SuperWeightAnalyzer(model, tokenizer, self.manager, self.mlp_handler, log_level)
+        
+        # Create appropriate detector based on architecture
+        self.detector = self._create_detector(log_level)
         
         # State tracking
         self.detected_super_weights = []
@@ -92,6 +92,7 @@ class SuperWeightResearchSession:
                 model=self.model,
                 tokenizer=self.tokenizer,
                 mlp_handler=self.mlp_handler,
+                manager=self.manager,
                 log_level=log_level
             )
     
@@ -545,7 +546,6 @@ class SuperWeightResearchSession:
 
 
 # Convenience functions for quick research workflows
-
 def quick_super_weight_analysis(model_name: str, 
                                detection_threshold: float = 50.0,
                                max_detailed_analysis: int = 3) -> Dict[str, Any]:

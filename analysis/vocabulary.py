@@ -3,177 +3,571 @@ import torch.nn as nn
 import numpy as np
 import scipy.stats
 from typing import List, Dict, Any, Optional
-from datasets import load_dataset
 
 from detection.super_weight import SuperWeight
 from utils.model_architectures import UniversalMLPHandler
-from analysis.results_manager import VocabularyResultsManager
+from utils.datasets import DatasetLoader
 from utils.device_utils import safe_matmul
 
 
 class VocabularyAnalyzer:
     """
-    Analyzes vocabulary effects of super weights using causal intervention.
-    Adapted from Universal Neurons methodology.
+    Analyzes how Super Weights affect model vocabulary and token probabilities.
+    
+    Provides methods for analyzing neuron vocabulary effects, measuring interventional 
+    impacts on loss/entropy, cascade effects through layers, token class enrichment
+    analysis, and control baselines for validation.
     """
 
-    def __init__(self, model, tokenizer, manager, mlp_handler: UniversalMLPHandler, results_dir: str = "results"):
+    def __init__(self, model, tokenizer, manager, mlp_handler: UniversalMLPHandler):
         self.model = model
         self.tokenizer = tokenizer
         self.manager = manager
-        self.mlp_handler = mlp_handler  # Use passed handler instead of creating new one
-        self.results_manager = VocabularyResultsManager(results_dir)
-    
-    def analyze_vocabulary_effects(self, super_weight: SuperWeight, 
-                                test_texts: Optional[List[str]] = None,
-                                dataset_name: Optional[str] = None,
-                                dataset_config: Optional[str] = None,
-                                n_samples: int = 500,
-                                max_length: int = 512) -> Dict[str, Any]:
+        self.mlp_handler = mlp_handler
+        self.dataset_loader = DatasetLoader(seed=42)
+        
+        # Cache for preprocessed unembedding matrix and stopword IDs
+        self._cached_unembedding = None
+        self._english_stop_ids = None
+        self._init_stopword_ids()
+
+    def _init_stopword_ids(self):
+        """Initialize cached stopword token IDs for efficient evaluation"""
+        stopwords = {'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'a', 'an'}
+        self._english_stop_ids = []
+        
+        for word in stopwords:
+            try:
+                # Try both with and without leading space
+                for variant in [word, ' ' + word]:
+                    token_ids = self.tokenizer.encode(variant, add_special_tokens=False)
+                    if len(token_ids) == 1:  # Single token
+                        self._english_stop_ids.append(token_ids[0])
+            except:
+                pass
+        
+        self._english_stop_ids = list(set(self._english_stop_ids))  # Remove duplicates
+
+    def _eval_windows(self, texts: List[str], window_len: int = 1024, stride: int = 512) -> Dict[str, float]:
         """
-        Analyze vocabulary effects using either custom texts or dataset samples.
+        Evaluate metrics using sliding windows for held-out evaluation.
+        
+        Tokenizes texts to fixed windows, computes per-token loss, entropy, 
+        top-k margin and stopword mass, then averages across all windows.
         
         Args:
-            super_weight: SuperWeight to analyze
-            test_texts: Optional list of custom test texts (takes priority if provided)
-            dataset_name: Dataset name (e.g., 'wikitext')
-            dataset_config: Dataset config (e.g., 'wikitext-2-raw-v1') 
-            n_samples: Number of dataset samples to use
-            max_length: Maximum sequence length for dataset samples
+            texts: List of text strings to evaluate
+            window_len: Length of each sliding window
+            stride: Stride between windows
             
         Returns:
-            Dictionary with vocabulary analysis results
+            Dictionary with averaged metrics across all windows
         """
-        
-        # Determine which text source to use
-        if test_texts is not None:
-            texts = test_texts
-            text_source = f"custom_texts (n={len(test_texts)})"
-        else:
-            if dataset_name is None:
-                dataset_name = 'wikitext'
-                dataset_config = 'wikitext-2-raw-v1'
+        self.model.eval()
+        with torch.inference_mode():
+            losses, entropies, margins, stop_masses = [], [], [], []
             
-            # Load dataset texts (reuse logic from metrics.py)
-            texts = self._load_dataset_texts(dataset_name, dataset_config, n_samples, max_length)
-            text_source = f"{dataset_name}/{dataset_config} (n={len(texts)})"
-        
-        # Get baseline vocabulary distribution
-        baseline_logits = self._compute_average_logits(texts)
-        
-        # Get modified distribution with super weight zeroed
-        with self.manager.temporary_zero([super_weight]):
-            modified_logits = self._compute_average_logits(texts)
-        
-        # Calculate the effect (what the super weight contributes)
-        vocab_effects = baseline_logits - modified_logits
-        
-        # Analyze the effects
-        statistics = self._compute_effect_statistics(vocab_effects)
-        classification = self._classify_super_weight_function(vocab_effects)
-        top_tokens = self._get_top_affected_tokens(vocab_effects)
-        patterns = self._analyze_token_patterns(vocab_effects)
-        
-        return {
-            'super_weight': super_weight,
-            'vocab_effects': vocab_effects.numpy(),
-            'statistics': statistics,
-            'classification': classification,
-            'top_tokens': top_tokens,
-            'patterns': patterns,
-            'baseline_logits': baseline_logits.numpy(),
-            'modified_logits': modified_logits.numpy(),
-            'text_source': text_source
-        }
-    
-    def analyze_neuron_vocabulary_effects(self, super_weight: SuperWeight) -> Dict[str, Any]:
+            for text in texts:
+                # Tokenize without truncation to get full sequence
+                toks = self.tokenizer(text, return_tensors='pt', truncation=False)
+                ids = toks.input_ids[0]
+                
+                # Process sliding windows
+                for s in range(0, max(1, ids.size(0) - 1), stride):
+                    win = ids[s:s + window_len]
+                    if win.size(0) < 2:
+                        break
+                    
+                    # Prepare inputs and targets
+                    inputs = {
+                        'input_ids': win[:-1].unsqueeze(0).to(self.model.device),
+                        'attention_mask': torch.ones_like(win[:-1]).unsqueeze(0).to(self.model.device)
+                    }
+                    targets = win[1:].unsqueeze(0).to(self.model.device)
+                    
+                    # Forward pass
+                    logits = self.model(**inputs).logits[0]  # [T, V]
+                    logprobs = logits.log_softmax(-1)
+                    
+                    # Per-token loss (skip first token in window)
+                    lp_true = logprobs.gather(-1, targets[0].unsqueeze(-1)).squeeze(-1)  # [T]
+                    window_loss = (-lp_true[1:]).mean().item() if lp_true.size(0) > 1 else (-lp_true).mean().item()
+                    losses.append(window_loss)
+                    
+                    # Per-token entropy (skip first token in window)  
+                    p = logprobs.exp()
+                    window_entropy = (-(p * logprobs).sum(-1)[1:]).mean().item() if logprobs.size(0) > 1 else (-(p * logprobs).sum(-1)).mean().item()
+                    entropies.append(window_entropy)
+                    
+                    # Top-k margin (skip first token in window)
+                    eval_probs = p[1:] if p.size(0) > 1 else p
+                    top2 = eval_probs.topk(2, dim=-1).values  # [T-1, 2]
+                    margin = (top2[:, 0] - top2[:, 1]).mean().item()
+                    margins.append(margin)
+                    
+                    # Stopword mass (skip first token in window)
+                    if self._english_stop_ids:
+                        eval_probs = p[1:] if p.size(0) > 1 else p
+                        stopword_mass = eval_probs[:, self._english_stop_ids].sum(-1).mean().item()
+                        stop_masses.append(stopword_mass)
+            
+            return {
+                'loss': float(np.mean(losses)) if losses else float('inf'),
+                'entropy': float(np.mean(entropies)) if entropies else 0.0,
+                'topk_margin': float(np.mean(margins)) if margins else 0.0,
+                'stopword_mass': float(np.mean(stop_masses)) if stop_masses else None,
+            }
+
+    def _compute_robust_correlation(self, effects1: torch.Tensor, effects2: torch.Tensor) -> float:
         """
-        Analyze vocabulary effects of the full neuron containing the super weight.
-        Uses direct computation (W_U @ w_out) like Universal Neurons paper.
+        Compute correlation with robustness against constant vectors.
+        
+        torch.corrcoef returns nan when a vector is (near) constant. This method
+        adds a small guard to handle such cases gracefully.
+        
+        Args:
+            effects1: First effect vector
+            effects2: Second effect vector
+            
+        Returns:
+            Correlation coefficient, or 0.0 if either vector is near-constant
+        """
+        # Check for near-constant vectors
+        if effects1.std() < 1e-8 or effects2.std() < 1e-8:
+            return 0.0
+        
+        try:
+            corr_matrix = torch.corrcoef(torch.stack([effects1, effects2]))
+            return float(corr_matrix[0, 1])
+        except:
+            return 0.0
+
+    def _load_token_filtered_texts(self, dataset_name: str = 'wikitext', 
+                                 config: str = 'wikitext-2-raw-v1',
+                                 n_samples: int = 100,
+                                 min_tokens: int = 10,
+                                 max_tokens: int = 2048) -> List[str]:
+        """
+        Load texts with token-level filtering instead of character-level.
+        
+        Uses tokenizer for precise length control and provides fallback for offline usage.
+        """
+        try:
+            # Try to load from dataset loader
+            candidate_texts = self.dataset_loader.load_perplexity_dataset(
+                dataset_name=dataset_name,
+                config=config,
+                n_samples=n_samples * 2,  # Load extra to account for filtering
+                min_length=1  # We'll do token-level filtering
+            )
+        except Exception:
+            # Fallback to simple texts if dataset loading fails
+            candidate_texts = [
+                "The quick brown fox jumps over the lazy dog.",
+                "Machine learning models can be trained on large datasets.",
+                "Python is a popular programming language for data science.",
+                "Natural language processing involves understanding human language.",
+                "Deep learning uses neural networks with multiple layers."
+            ] * (n_samples // 5 + 1)
+        
+        # Filter by token length
+        filtered_texts = []
+        for text in candidate_texts:
+            try:
+                # Tokenize and check length
+                tokens = self.tokenizer(text, truncation=False, return_tensors='pt')
+                token_count = tokens['input_ids'].shape[1]
+                
+                if min_tokens <= token_count <= max_tokens:
+                    filtered_texts.append(text)
+                elif token_count > max_tokens:
+                    # Truncate and decode back to text
+                    truncated_tokens = self.tokenizer(text, max_length=max_tokens, 
+                                                    truncation=True, return_tensors='pt')
+                    truncated_text = self.tokenizer.decode(truncated_tokens['input_ids'][0], 
+                                                         skip_special_tokens=True)
+                    filtered_texts.append(truncated_text)
+                    
+                if len(filtered_texts) >= n_samples:
+                    break
+            except:
+                continue
+        
+        return filtered_texts[:n_samples]
+
+    def analyze_neuron_vocabulary_effects(self, super_weight: SuperWeight, 
+                                         apply_universal_neurons_processing: bool = True) -> Dict[str, Any]:
+        """
+        Analyze vocabulary effects of the neuron containing the super weight.
+        
+        Computes e = W_U @ w_out for the intermediate neuron and reports statistical
+        moments, top affected tokens, and function classification.
+        
+        Args:
+            super_weight: SuperWeight to analyze (analyzes the neuron containing it)
+            apply_universal_neurons_processing: Apply layer norm folding and mean-centering
+        
+        Returns:
+            Dictionary containing vocabulary effects, statistics, classification, and top tokens
         """
         try:
             with torch.no_grad():
-                # Get the neuron's output vector (the row from down/output projection)
-                neuron_output_weight, component_name = self._get_mlp_component_info(super_weight.layer)
-                neuron_output_vector = neuron_output_weight[super_weight.row]  # Get the row
+                # Get the down projection matrix containing the super weight
+                components = self.mlp_handler.get_mlp_components(super_weight.layer)
+                if 'down' not in components:
+                    raise ValueError(f"No down projection found in layer {super_weight.layer}")
                 
-                # Get unembedding matrix
-                unembedding_matrix = self._get_unembedding_matrix()
+                down_proj = components['down']
                 
-                # Compute direct effect: W_U @ w_out
-                vocab_effects = safe_matmul(unembedding_matrix, neuron_output_vector, result_device='cpu')
+                # Get sw_neuron: the neuron that contains our super weight
+                # This is the column vector showing how this neuron affects all output dimensions
+                sw_neuron = down_proj.weight[:, super_weight.column]  # [2048]
+                
+                # Get unembedding matrix with Universal Neurons processing
+                unembedding_matrix = self._get_unembedding_matrix(apply_universal_neurons_processing)
+                
+                # Apply mean-centering to neuron if processing is enabled (paper-faithful)
+                if apply_universal_neurons_processing:
+                    sw_neuron = sw_neuron - sw_neuron.mean()
+                
+                # Compute vocabulary effects: e = W_U @ w_out
+                vocab_effects_raw = safe_matmul(unembedding_matrix, sw_neuron, result_device='cpu')
+                
+                # Cosine similarity variant (norm-robust)
+                vocab_effects_cosine = self._compute_cosine_vocab_effects(unembedding_matrix, sw_neuron)
             
-            # Analyze the effects using same methods as intervention analysis
-            statistics = self._compute_effect_statistics(vocab_effects)
-            classification = self._classify_super_weight_function(vocab_effects)
-            top_tokens = self._get_top_affected_tokens(vocab_effects)
-            patterns = self._analyze_token_patterns(vocab_effects)
+            # Analyze both variants
+            raw_analysis = self._analyze_vocab_effects(vocab_effects_raw, "raw_dot_product")
+            cosine_analysis = self._analyze_vocab_effects(vocab_effects_cosine, "cosine_similarity")
             
             return {
                 'super_weight': super_weight,
-                'analysis_type': 'neuron_direct',
-                'neuron_coordinates': (super_weight.layer, super_weight.row),
-                'vocab_effects': vocab_effects.cpu().numpy(),
-                'statistics': statistics,
-                'classification': classification,
-                'top_tokens': top_tokens,
-                'patterns': patterns,
-                'neuron_output_norm': float(torch.norm(neuron_output_vector))
+                'sw_neuron_coordinates': (super_weight.layer, super_weight.column),
+                'processing_applied': apply_universal_neurons_processing,
+                'raw_analysis': raw_analysis,
+                'cosine_analysis': cosine_analysis,
+                # Main results
+                'vocab_effects': vocab_effects_raw.cpu().numpy(),
+                'statistics': raw_analysis['statistics'],
+                'classification': raw_analysis['classification'],
+                'top_tokens': raw_analysis['top_tokens'],
+                'enrichment': raw_analysis['enrichment']
             }
             
         except Exception as e:
             return {
                 'super_weight': super_weight,
-                'analysis_type': 'neuron_direct',
-                'error': f"Failed to analyze neuron: {str(e)}"
+                'error': f"Failed to analyze sw_neuron: {str(e)}"
+            }
+
+    def analyze_super_weight_intervention(self, super_weight: SuperWeight, 
+                                        test_texts: Optional[List[str]] = None,
+                                        n_samples: int = 100) -> Dict[str, Any]:
+        """
+        Measure the interventional effect of zeroing a super weight.
+        
+        Compares model behavior with and without the super weight to quantify
+        its contribution to loss, entropy, top-k margin, and stopword probability mass
+        using sliding window evaluation for robust metrics.
+        
+        Args:
+            super_weight: SuperWeight to analyze
+            test_texts: Optional custom texts (otherwise uses wikitext)
+            n_samples: Number of samples to use
+            
+        Returns:
+            Dictionary with baseline and modified metrics plus deltas
+        """
+        # Get test texts with improved token-level filtering
+        if test_texts is None:
+            test_texts = self._load_token_filtered_texts(
+                dataset_name='wikitext',
+                config='wikitext-2-raw-v1',
+                n_samples=n_samples,
+                min_tokens=10,
+                max_tokens=2048
+            )
+        
+        # Measure baseline metrics using windowed evaluation
+        baseline_metrics = self._eval_windows(test_texts)
+        
+        # Measure with intervention
+        with self.manager.temporary_zero([super_weight]):
+            modified_metrics = self._eval_windows(test_texts)
+        
+        return {
+            'super_weight': super_weight,
+            'baseline_loss': baseline_metrics['loss'],
+            'modified_loss': modified_metrics['loss'],
+            'delta_loss': modified_metrics['loss'] - baseline_metrics['loss'],
+            'baseline_entropy': baseline_metrics['entropy'],
+            'modified_entropy': modified_metrics['entropy'],
+            'delta_entropy': modified_metrics['entropy'] - baseline_metrics['entropy'],
+            'baseline_topk_margin': baseline_metrics['topk_margin'],
+            'modified_topk_margin': modified_metrics['topk_margin'],
+            'delta_topk_margin': modified_metrics['topk_margin'] - baseline_metrics['topk_margin'],
+            'baseline_stopword_mass': baseline_metrics['stopword_mass'],
+            'modified_stopword_mass': modified_metrics['stopword_mass'],
+            'delta_stopword_mass': (modified_metrics['stopword_mass'] - baseline_metrics['stopword_mass']) if baseline_metrics['stopword_mass'] is not None else None,
+            'n_samples': len(test_texts)
+        }
+
+    def analyze_cascade_effects(self, super_weight: SuperWeight, 
+                               input_text: str = "Apple Inc. is a tech company.",
+                               num_layers: int = 5,
+                               top_k_margin: int = 10) -> Dict[str, Any]:
+        """
+        Analyze how super weight effects propagate through model layers.
+        
+        Captures residual stream activations of the last token at multiple layers both 
+        with and without the super weight intervention. Projects each layer's residual 
+        through the unembedding matrix to measure vocabulary effects at different depths.
+        
+        Args:
+            super_weight: SuperWeight to analyze
+            input_text: Text to analyze cascade effects on
+            num_layers: Number of layers to sample for cascade analysis
+            top_k_margin: K value for computing top-k margin changes
+            
+        Returns:
+            Dictionary with per-layer entropy changes, effect patterns, and actual layer indices
+        """
+        try:
+            # Tokenize input
+            tokens = self.tokenizer(input_text, return_tensors='pt').to(self.model.device)
+            
+            # Get unembedding matrix for projections
+            unembedding_matrix = self._get_unembedding_matrix(apply_universal_neurons_processing=False)
+            
+            # Capture residual streams at key layers (now returns layer indices too)
+            baseline_residuals, actual_layer_indices = self._capture_residual_layers(tokens, num_layers=num_layers)
+            
+            with self.manager.temporary_zero([super_weight]):
+                modified_residuals, _ = self._capture_residual_layers(tokens, num_layers=num_layers)
+            
+            # Analyze differences at each layer
+            layer_effects = {}
+            for i, (baseline_res, modified_res) in enumerate(zip(baseline_residuals, modified_residuals)):
+                actual_layer_idx = actual_layer_indices[i]
+                
+                # Project to vocabulary space
+                baseline_logits = safe_matmul(baseline_res, unembedding_matrix.T, result_device='cpu')
+                modified_logits = safe_matmul(modified_res, unembedding_matrix.T, result_device='cpu')
+                
+                # Compute differences
+                logit_diff = baseline_logits - modified_logits
+                
+                # Compute entropy change
+                baseline_entropy = -torch.sum(torch.softmax(baseline_logits, dim=-1) * torch.log_softmax(baseline_logits, dim=-1))
+                modified_entropy = -torch.sum(torch.softmax(modified_logits, dim=-1) * torch.log_softmax(modified_logits, dim=-1))
+                entropy_change = float(baseline_entropy - modified_entropy)
+                
+                # Compute top-k margin change (now configurable)
+                baseline_top_k = torch.topk(baseline_logits, top_k_margin).values
+                modified_top_k = torch.topk(modified_logits, top_k_margin).values
+                margin_change = float((baseline_top_k[0] - baseline_top_k[1]) - (modified_top_k[0] - modified_top_k[1]))
+                
+                layer_effects[actual_layer_idx] = {
+                    'entropy_change': entropy_change,
+                    'margin_change': margin_change,
+                    'effect_magnitude': float(torch.norm(logit_diff)),
+                    'layer_index': actual_layer_idx  # Include actual layer index
+                }
+            
+            return {
+                'super_weight': super_weight,
+                'input_text': input_text,
+                'layer_effects': layer_effects,
+                'actual_layer_indices': actual_layer_indices,  # Return actual layer indices
+                'amplification_pattern': self._classify_cascade_pattern(layer_effects),
+                'num_layers_analyzed': len(actual_layer_indices),
+                'top_k_margin': top_k_margin
+            }
+            
+        except Exception as e:
+            return {
+                'super_weight': super_weight,
+                'error': f"Cascade analysis failed: {str(e)}"
+            }
+
+    def analyze_token_class_enrichment(self, vocab_effects: torch.Tensor) -> Dict[str, Any]:
+        """
+        Analyze enrichment of vocabulary effects within semantic token classes.
+        
+        Tests whether vocabulary effects are concentrated within specific token
+        categories (digits, years, punctuation, etc.) using variance reduction.
+        
+        Args:
+            vocab_effects: Vocabulary effects vector [vocab_size]
+            
+        Returns:
+            Dictionary with enrichment scores and best enriched token class
+        """
+        # Define token classes for enrichment analysis
+        token_classes = {
+            'digits': lambda t: t.strip().isdigit(),
+            'years': lambda t: t.strip().isdigit() and 1700 <= int(t.strip()) <= 2050 if t.strip().isdigit() else False,
+            'parens': lambda t: any(char in t for char in '()[]{}'),
+            'whitespace_prefixed': lambda t: t.startswith(' '),
+            'caps': lambda t: t.strip() and t.strip()[0].isupper(),
+            'pronouns': lambda t: t.strip().lower() in {'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them'},
+            'punctuation': lambda t: any(char in t for char in '.,!?;:'),
+            'stopwords': lambda t: t.strip().lower() in {'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
+        }
+        
+        enrichment_scores = {}
+        class_effects = {}
+        
+        # Compute enrichment for each token class
+        for class_name, classifier_func in token_classes.items():
+            class_effects_list = []
+            non_class_effects_list = []
+            special_token_ids = set(getattr(self.tokenizer, 'all_special_ids', []))
+            
+            for token_id in range(vocab_effects.shape[0]):
+                if token_id in special_token_ids:
+                    continue
+                    
+                try:
+                    # Use improved token handling
+                    raw_token = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+                    token_str = self.tokenizer.convert_tokens_to_string([raw_token])
+                    effect = vocab_effects[token_id].item()
+                    
+                    if classifier_func(token_str):
+                        class_effects_list.append(effect)
+                    else:
+                        non_class_effects_list.append(effect)
+                except:
+                    # Skip problematic tokens
+                    non_class_effects_list.append(vocab_effects[token_id].item())
+            
+            if len(class_effects_list) < 5:  # Too few examples
+                enrichment_scores[class_name] = 0.0
+                class_effects[class_name] = {'mean': 0.0, 'count': len(class_effects_list)}
+                continue
+            
+            # Compute variance reduction (enrichment score)
+            class_var = np.var(class_effects_list)
+            non_class_var = np.var(non_class_effects_list) if non_class_effects_list else 1.0
+            overall_var = np.var(vocab_effects.numpy())
+            
+            # Enrichment score: how much variance is explained by this class
+            enrichment_score = (overall_var - (len(class_effects_list) * class_var + len(non_class_effects_list) * non_class_var) / len(vocab_effects)) / overall_var
+            enrichment_scores[class_name] = max(0.0, enrichment_score)
+            
+            class_effects[class_name] = {
+                'mean': np.mean(class_effects_list),
+                'var': class_var,
+                'count': len(class_effects_list),
+                'top_effects': sorted(class_effects_list, key=abs, reverse=True)[:5]
             }
         
-    def _compute_average_logits(self, test_texts: List[str]) -> torch.Tensor:
-        """Compute average logits across test texts for the last token"""
-        all_logits = []
+        # Find best theme
+        best_theme = max(enrichment_scores.items(), key=lambda x: x[1])
         
-        for text in test_texts:
-            tokens = self.tokenizer(text, return_tensors='pt').to(self.model.device)
-            with torch.no_grad():
-                outputs = self.model(**tokens)
-                # Take logits for the last token
-                last_token_logits = outputs.logits[0, -1, :].cpu()
-                all_logits.append(last_token_logits)
-        
-        # Average across all test texts
-        return torch.stack(all_logits).mean(dim=0)
-    
-    def _load_dataset_texts(self, dataset_name: str, dataset_config: str, 
-                       n_samples: int, max_length: int) -> List[str]:
-        """Load and preprocess texts from dataset (adapted from metrics.py)"""
-        
-        dataset = load_dataset(dataset_name, dataset_config, split='test', streaming=True)
-        # shuffle the dataset to get diverse samples
-        dataset = dataset.shuffle(seed=42)
-        # Extract texts
-        texts = []
-        for i, item in enumerate(dataset):
-            if i >= n_samples:
-                break
-            text = item['text'].strip() if 'text' in item else item['sentence'].strip()
-            if not text:
-                continue
-            # Truncate to max_length
-            if len(text) > max_length:
-                text = text[:max_length]
-            texts.append(text)
+        return {
+            'enrichment_scores': enrichment_scores,
+            'class_effects': class_effects,
+            'best_theme': {
+                'class': best_theme[0],
+                'score': best_theme[1],
+                'description': f"Effects concentrated in {best_theme[0]} tokens"
+            }
+        }
 
-        if not texts:
-            raise ValueError(f"No valid texts found in dataset {dataset_name}/{dataset_config}. "
-                             f"Ensure the dataset has a 'text' or 'sentence' field.")
-        return texts
+    @torch.no_grad()
+    def analyze_controls_and_baselines(self, super_weight: SuperWeight,
+                                     test_texts: Optional[List[str]] = None,
+                                     n_samples: int = 50) -> Dict[str, Any]:
+        """
+        Run control experiments to validate super weight effects.
+        
+        Performs three control experiments: magnitude-matched random ablation,
+        full neuron vs single scalar ablation comparison, and deterministic
+        no-op verification.
+        
+        Args:
+            super_weight: SuperWeight to analyze
+            test_texts: Optional test texts for evaluation
+            n_samples: Number of samples for analysis
+            
+        Returns:
+            Dictionary with control experiment results
+        """
+        if test_texts is None:
+            test_texts = self._load_token_filtered_texts(
+                dataset_name='wikitext',
+                config='wikitext-2-raw-v1',
+                n_samples=n_samples,
+                min_tokens=10,
+                max_tokens=2048
+            )
+        
+        # 1. Magnitude-matched random scalar ablation
+        random_coord = self._get_random_coordinate_same_magnitude(super_weight)
+        sw_effect = self.analyze_super_weight_intervention(super_weight, test_texts)
+        random_effect = self.analyze_super_weight_intervention(random_coord, test_texts)
+        
+        # 2. Neuron vs scalar comparison
+        neuron_vs_scalar = self._compare_neuron_vs_scalar_ablation(super_weight, test_texts)
+        
+        # 3. No-op check (deterministic verification)
+        noop_check = self._verify_deterministic_noop(super_weight, test_texts)
+        
+        return {
+            'super_weight': super_weight,
+            'random_baseline': {
+                'random_coord': random_coord,
+                'sw_delta_loss': sw_effect['delta_loss'],
+                'random_delta_loss': random_effect['delta_loss'],
+                'specificity_ratio': abs(sw_effect['delta_loss']) / max(abs(random_effect['delta_loss']), 1e-6)
+            },
+            'neuron_vs_scalar': neuron_vs_scalar,
+            'noop_check': noop_check
+        }
+
+    # Helper methods
+    def _compute_cosine_vocab_effects(self, unembedding_matrix: torch.Tensor, 
+                                    sw_neuron: torch.Tensor) -> torch.Tensor:
+        """
+        Compute cosine similarity variant (norm-robust).
+        
+        Uses F.cosine_similarity for cleaner implementation and better numerical stability.
+        """
+        # Use functional cosine similarity for cleaner, more robust computation
+        cosine_similarities = torch.nn.functional.cosine_similarity(
+            unembedding_matrix, sw_neuron.unsqueeze(0), dim=1
+        )
+        return cosine_similarities.cpu()
+    
+    def _analyze_vocab_effects(self, vocab_effects: torch.Tensor, analysis_type: str) -> Dict[str, Any]:
+        """Analyze vocabulary effects for either raw or cosine variants"""
+        statistics = self._compute_effect_statistics(vocab_effects)
+        classification = self._classify_super_weight_function(vocab_effects)
+        top_tokens = self._get_top_affected_tokens(vocab_effects)
+        enrichment = self.analyze_token_class_enrichment(vocab_effects)
+        
+        return {
+            'analysis_type': analysis_type,
+            'statistics': statistics,
+            'classification': classification,
+            'top_tokens': top_tokens,
+            'enrichment': enrichment
+        }
     
     def _compute_effect_statistics(self, vocab_effects: torch.Tensor) -> Dict[str, float]:
-        """Compute statistical properties of vocabulary effects"""
+        """
+        Compute comprehensive statistics: moments, percentiles, and significance counts.
         
-        # Ensure tensor is detached and on CPU
+        Tracks both moments and percentiles for robust analysis across different
+        effect distributions (raw dot products vs cosine similarities).
+        """
         vocab_effects = vocab_effects.detach().cpu()
         effects_np = vocab_effects.numpy()
+        
+        # Compute percentiles for robust statistics
+        percentiles = np.percentile(effects_np, [1, 5, 25, 50, 75, 95, 99])
         
         return {
             'mean': float(torch.mean(vocab_effects)),
@@ -183,1463 +577,411 @@ class VocabularyAnalyzer:
             'skew': float(scipy.stats.skew(effects_np)),
             'max_effect': float(torch.max(vocab_effects)),
             'min_effect': float(torch.min(vocab_effects)),
-            'num_positive': int(torch.sum(vocab_effects > 0)),
-            'num_negative': int(torch.sum(vocab_effects < 0)),
-            'num_significant': int(torch.sum(torch.abs(vocab_effects) > 1.0))
+            'num_significant': int(torch.sum(torch.abs(vocab_effects) > 1.0)),
+            'percentiles': {
+                'p1': float(percentiles[0]),
+                'p5': float(percentiles[1]),
+                'p25': float(percentiles[2]),
+                'p50': float(percentiles[3]),
+                'p75': float(percentiles[4]),
+                'p95': float(percentiles[5]),
+                'p99': float(percentiles[6])
+            }
         }
     
     def _classify_super_weight_function(self, vocab_effects: torch.Tensor) -> Dict[str, Any]:
         """
-        Classify super weight function based on vocabulary effects.
-        Adapted from Universal Neurons paper classification system.
+        Classify neuron function as prediction/suppression/partition based on effect distribution.
+        
+        Uses kurtosis/skew for concentrated effects and variance + both-sign mass for partitions.
         """
         effects_np = vocab_effects.numpy()
         kurtosis = scipy.stats.kurtosis(effects_np)
         skew = scipy.stats.skew(effects_np)
         variance = float(torch.var(vocab_effects))
         
-        # Classification logic from Universal Neurons paper
+        # Check for partition pattern: high variance with both positive and negative effects
+        pos_frac = (vocab_effects > 0).float().mean().item()
+        neg_frac = (vocab_effects < 0).float().mean().item()
+        
         if kurtosis > 10:  # Very concentrated effects
             if skew > 0:
                 function_type = "prediction"
                 description = "Boosts probability of specific token sets"
             else:
-                function_type = "suppression"
+                function_type = "suppression" 
                 description = "Reduces probability of specific token sets"
-        elif variance > 1.0:  # Broadly distributed effects
+        elif variance > 1.0 and pos_frac >= 0.1 and neg_frac >= 0.1:  # Partition check with both-sign mass
             function_type = "partition"
             description = "Affects broad token classes (boost some, suppress others)"
         else:
             function_type = "unclear"
             description = "Effects too small or distributed to classify clearly"
         
+        confidence = min(1.0, max(0.0, (abs(kurtosis) + variance) / 20.0))
+        
         return {
             'type': function_type,
             'description': description,
-            'confidence': self._compute_classification_confidence(kurtosis, skew, variance),
-            'metrics': {
-                'kurtosis': kurtosis,
-                'skew': skew,
-                'variance': variance
-            }
+            'confidence': confidence,
+            'kurtosis': kurtosis,
+            'skew': skew,
+            'variance': variance,
+            'pos_fraction': pos_frac,
+            'neg_fraction': neg_frac
         }
     
-    def _compute_classification_confidence(self, kurtosis: float, skew: float, variance: float) -> float:
-        """Compute confidence score for classification (0-1)"""
-        if kurtosis > 20:
-            return 0.9
-        elif kurtosis > 10:
-            return 0.7
-        elif variance > 2.0:
-            return 0.6
-        else:
-            return 0.3
-    
     def _get_top_affected_tokens(self, vocab_effects: torch.Tensor, top_k: int = 20) -> Dict[str, List[Dict]]:
-        """Get the most positively and negatively affected tokens"""
+        """
+        Get top boosted and suppressed tokens with improved token string handling.
         
-        # Top boosted tokens (positive effects)
-        top_boosted_indices = torch.argsort(vocab_effects, descending=True)[:top_k]
+        Uses convert_ids_to_tokens for raw tokens and convert_tokens_to_string for display,
+        filters out special tokens.
+        """
+        effects_cpu = vocab_effects.cpu()
+        special_token_ids = set(getattr(self.tokenizer, 'all_special_ids', []))
+        
+        # Get top boosted (most positive effects)
+        top_boosted_indices = torch.topk(effects_cpu, min(top_k * 3, len(effects_cpu))).indices  # Get extra to filter
         top_boosted = []
         for idx in top_boosted_indices:
             token_id = idx.item()
+            if token_id in special_token_ids:
+                continue
+                
             try:
-                token_str = self.tokenizer.decode([token_id])
+                # Get raw token representation
+                raw_token = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+                # Get pretty string representation
+                token_str = self.tokenizer.convert_tokens_to_string([raw_token])
+                
                 top_boosted.append({
                     'token_id': token_id,
                     'token_str': token_str,
-                    'effect_magnitude': vocab_effects[idx].item()
+                    'raw_token': raw_token,
+                    'effect_magnitude': effects_cpu[idx].item()
                 })
+                
+                if len(top_boosted) >= top_k:
+                    break
             except:
-                # Skip tokens that can't be decoded
-                continue
+                pass
         
-        # Top suppressed tokens (negative effects)
-        top_suppressed_indices = torch.argsort(vocab_effects, descending=False)[:top_k]
+        # Get top suppressed (most negative effects)
+        top_suppressed_indices = torch.topk(-effects_cpu, min(top_k * 3, len(effects_cpu))).indices
         top_suppressed = []
         for idx in top_suppressed_indices:
             token_id = idx.item()
+            if token_id in special_token_ids:
+                continue
+                
             try:
-                token_str = self.tokenizer.decode([token_id])
+                # Get raw token representation
+                raw_token = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+                # Get pretty string representation
+                token_str = self.tokenizer.convert_tokens_to_string([raw_token])
+                
                 top_suppressed.append({
                     'token_id': token_id,
                     'token_str': token_str,
-                    'effect_magnitude': vocab_effects[idx].item()
+                    'raw_token': raw_token,
+                    'effect_magnitude': effects_cpu[idx].item()
                 })
+                
+                if len(top_suppressed) >= top_k:
+                    break
             except:
-                continue
+                pass
         
         return {
             'top_boosted': top_boosted,
             'top_suppressed': top_suppressed
         }
     
-    def _analyze_token_patterns(self, vocab_effects: torch.Tensor, threshold: float = 1.0) -> Dict[str, List[Dict]]:
+    def _get_unembedding_matrix(self, apply_universal_neurons_processing: bool = True) -> torch.Tensor:
         """
-        Analyze linguistic patterns in affected tokens.
-        Based on Universal Neurons paper pattern detection.
+        Get unembedding matrix with optional preprocessing for cleaner analysis.
+        
+        Applies paper-faithful preprocessing: mean-center rows to remove softmax translation bias.
+        Caches the processed matrix for efficiency.
         """
-        significant_effects = torch.abs(vocab_effects) > threshold
-        affected_token_ids = torch.where(significant_effects)[0]
-        
-        patterns = {
-            'years': [],
-            'punctuation': [],
-            'function_words': [],
-            'numbers': [],
-            'capitalized': [],
-            'space_prefixed': [],
-            'sophisticated_words': [],
-            'fragments': []
-        }
-        
-        # Common function words
-        function_words = {'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
-        
-        # Sophisticated words
-        sophisticated_words = {'improving', 'shaping', 'leading', 'changing', 'developing', 'creating'}
-        
-        for token_id in affected_token_ids:
-            try:
-                token_str = self.tokenizer.decode([token_id.item()])
-                effect = vocab_effects[token_id.item()].item()
-                
-                token_info = {
-                    'token_id': token_id.item(),
-                    'token_str': token_str,
-                    'effect': effect
-                }
-                
-                # Pattern classification
-                token_stripped = token_str.strip()
-                
-                # Years (1700-2050 range from Universal Neurons paper)
-                if token_stripped.isdigit() and 1700 <= int(token_stripped) <= 2050:
-                    patterns['years'].append(token_info)
-                
-                # Punctuation
-                elif any(char in token_str for char in '.,!?;:()[]{}'):
-                    patterns['punctuation'].append(token_info)
-                
-                # Function words
-                elif token_stripped.lower() in function_words:
-                    patterns['function_words'].append(token_info)
-                
-                # Numbers (general)
-                elif token_stripped.isdigit():
-                    patterns['numbers'].append(token_info)
-                
-                # Capitalized words
-                elif token_stripped and token_stripped[0].isupper():
-                    patterns['capitalized'].append(token_info)
-                
-                # Space-prefixed tokens
-                elif token_str.startswith(' '):
-                    patterns['space_prefixed'].append(token_info)
-                
-                # Sophisticated words
-                elif any(word in token_str.lower() for word in sophisticated_words):
-                    patterns['sophisticated_words'].append(token_info)
-                
-                # Fragments (short tokens)
-                elif len(token_stripped) <= 3 and token_stripped.isalpha():
-                    patterns['fragments'].append(token_info)
-                
-            except:
-                # Skip tokens that can't be decoded or processed
-                continue
-        
-        # Sort each pattern by effect magnitude
-        for pattern_name in patterns:
-            patterns[pattern_name].sort(key=lambda x: abs(x['effect']), reverse=True)
-        
-        return patterns
-    
-    
-    def display_analysis_results(self, analysis_results: Dict[str, Any], top_k: int = 10) -> None:
-        """Display vocabulary analysis results in a readable format"""
-        
-        sw = analysis_results['super_weight']
-        stats = analysis_results['statistics']
-        classification = analysis_results['classification']
-        top_tokens = analysis_results['top_tokens']
-        patterns = analysis_results['patterns']
-        
-        print(f"\n=== Vocabulary Analysis: {sw} ===")
-        
-        # Basic statistics
-        print(f"\nEffect Statistics:")
-        print(f"  Mean: {stats['mean']:.4f}")
-        print(f"  Std: {stats['std']:.4f}")
-        print(f"  Kurtosis: {stats['kurtosis']:.4f}")
-        print(f"  Skew: {stats['skew']:.4f}")
-        print(f"  Significant effects: {stats['num_significant']}")
-        
-        # Classification
-        print(f"\nClassification:")
-        print(f"  Type: {classification['type'].upper()}")
-        print(f"  Description: {classification['description']}")
-        print(f"  Confidence: {classification['confidence']:.2f}")
-        
-        # Top affected tokens
-        print(f"\nTop {top_k} Boosted Tokens:")
-        for i, token_info in enumerate(top_tokens['top_boosted'][:top_k]):
-            token_repr = repr(token_info['token_str'])  # Shows spaces, newlines clearly
-            print(f"  {i+1:2d}. {token_repr:20s} (effect: {token_info['effect_magnitude']:+.3f})")
-        
-        print(f"\nTop {top_k} Suppressed Tokens:")
-        for i, token_info in enumerate(top_tokens['top_suppressed'][:top_k]):
-            token_repr = repr(token_info['token_str'])
-            print(f"  {i+1:2d}. {token_repr:20s} (effect: {token_info['effect_magnitude']:+.3f})")
-        
-        # Pattern analysis
-        print(f"\nDetected Patterns:")
-        for pattern_name, tokens in patterns.items():
-            if tokens:
-                print(f"  {pattern_name.upper()}: {len(tokens)} tokens")
-                # Show a few examples
-                examples = [repr(t['token_str']) for t in tokens[:3]]
-                print(f"    Examples: {', '.join(examples)}")
-    
-    def compare_super_weights(self, super_weights: List[SuperWeight], 
-                            test_texts: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Compare vocabulary effects across multiple super weights"""
-        
-        results = {}
-        effect_similarities = {}
-        
-        # Analyze each super weight
-        for sw in super_weights:
-            results[str(sw)] = self.analyze_vocabulary_effects(sw, test_texts)
-        
-        # Compute pairwise similarities
-        sw_keys = list(results.keys())
-        for i, sw1_key in enumerate(sw_keys):
-            for j, sw2_key in enumerate(sw_keys[i+1:], i+1):
-                effects1 = torch.tensor(results[sw1_key]['vocab_effects'])
-                effects2 = torch.tensor(results[sw2_key]['vocab_effects'])
-                
-                # Compute cosine similarity
-                cosine_sim = torch.cosine_similarity(effects1, effects2, dim=0).item()
-                
-                # Compute correlation
-                correlation = torch.corrcoef(torch.stack([effects1, effects2]))[0, 1].item()
-                
-                effect_similarities[f"{sw1_key} vs {sw2_key}"] = {
-                    'cosine_similarity': cosine_sim,
-                    'correlation': correlation
-                }
-        
-        return {
-            'individual_analyses': results,
-            'similarities': effect_similarities,
-            'summary': self._create_comparison_summary(results, effect_similarities)
-        }
-    
-    def _create_comparison_summary(self, results: Dict, similarities: Dict) -> Dict[str, Any]:
-        """Create a summary of the comparison results"""
-        
-        # Count function types
-        function_types = {}
-        for analysis in results.values():
-            func_type = analysis['classification']['type']
-            function_types[func_type] = function_types.get(func_type, 0) + 1
-        
-        # Find most similar pair
-        most_similar = max(similarities.items(), key=lambda x: x[1]['cosine_similarity'])
-        
-        # Find most different pair
-        most_different = min(similarities.items(), key=lambda x: x[1]['cosine_similarity'])
-        
-        return {
-            'total_super_weights': len(results),
-            'function_type_distribution': function_types,
-            'most_similar_pair': {
-                'pair': most_similar[0],
-                'cosine_similarity': most_similar[1]['cosine_similarity']
-            },
-            'most_different_pair': {
-                'pair': most_different[0],
-                'cosine_similarity': most_different[1]['cosine_similarity']
-            },
-            'average_similarity': np.mean([sim['cosine_similarity'] for sim in similarities.values()])
-        }
-    
-
-    def compare_neuron_vs_super_weight(self, super_weight: SuperWeight,
-                                    test_texts: Optional[List[str]] = None,
-                                    dataset_name: Optional[str] = None,
-                                    dataset_config: Optional[str] = None,
-                                    n_samples: int = 500) -> Dict[str, Any]:
-        """
-        Compare vocabulary effects between the full neuron and the super weight contribution.
-        
-        Args:
-            super_weight: SuperWeight to analyze
-            test_texts: Optional custom test texts for super weight analysis
-            dataset_name: Dataset for super weight analysis (if test_texts is None)
-            dataset_config: Dataset config
-            n_samples: Number of samples for dataset analysis
+        # Return cached version if available and processing matches
+        cache_key = apply_universal_neurons_processing
+        if hasattr(self, '_cached_unembedding') and hasattr(self, '_cache_processed') and self._cache_processed == cache_key:
+            return self._cached_unembedding
             
-        Returns:
-            Dictionary with comparison results
-        """
-        
-        # Run both analyses
-        print(f"Analyzing full neuron containing {super_weight}...")
-        neuron_analysis = self.analyze_neuron_vocabulary_effects(super_weight)
-        
-        print(f"Analyzing super weight contribution via intervention...")
-        super_weight_analysis = self.analyze_vocabulary_effects(
-            super_weight, test_texts, dataset_name, dataset_config, n_samples
-        )
-        
-        # Check for errors
-        if 'error' in neuron_analysis:
-            return {
-                'comparison_type': 'neuron_vs_super_weight',
-                'super_weight': super_weight,
-                'neuron_analysis': neuron_analysis,
-                'super_weight_analysis': super_weight_analysis,
-                'error': f"Neuron analysis failed: {neuron_analysis['error']}"
-            }
-        
-        if 'error' in super_weight_analysis:
-            return {
-                'comparison_type': 'neuron_vs_super_weight',
-                'super_weight': super_weight,
-                'neuron_analysis': neuron_analysis,
-                'super_weight_analysis': super_weight_analysis,
-                'error': f"Super weight analysis failed: {super_weight_analysis['error']}"
-            }
-        
-        # Compare the vocabulary effects
-        neuron_effects = torch.tensor(neuron_analysis['vocab_effects'])
-        sw_effects = torch.tensor(super_weight_analysis['vocab_effects'])
-        
-        # Compute correlation
-        correlation = torch.corrcoef(torch.stack([neuron_effects, sw_effects]))[0, 1].item()
-        
-        # Compute cosine similarity
-        cosine_sim = torch.cosine_similarity(neuron_effects, sw_effects, dim=0).item()
-        
-        # Compute effect magnitude ratios
-        neuron_max_effect = float(torch.max(torch.abs(neuron_effects)))
-        sw_max_effect = float(torch.max(torch.abs(sw_effects)))
-        magnitude_ratio = sw_max_effect / neuron_max_effect if neuron_max_effect > 0 else 0.0
-        
-        # Compare statistics
-        neuron_stats = neuron_analysis['statistics']
-        sw_stats = super_weight_analysis['statistics']
-        
-        stats_comparison = {
-            'kurtosis_ratio': sw_stats['kurtosis'] / neuron_stats['kurtosis'] if neuron_stats['kurtosis'] != 0 else 0.0,
-            'skew_difference': sw_stats['skew'] - neuron_stats['skew'],
-            'std_ratio': sw_stats['std'] / neuron_stats['std'] if neuron_stats['std'] != 0 else 0.0,
-            'mean_difference': sw_stats['mean'] - neuron_stats['mean']
-        }
-        
-        # Compare classifications
-        neuron_class = neuron_analysis['classification']['type']
-        sw_class = super_weight_analysis['classification']['type']
-        classification_match = neuron_class == sw_class
-        
-        # Find top overlapping tokens
-        neuron_top_tokens = set(token['token_str'] for token in neuron_analysis['top_tokens']['top_boosted'][:20])
-        neuron_top_tokens.update(token['token_str'] for token in neuron_analysis['top_tokens']['top_suppressed'][:20])
-        
-        sw_top_tokens = set(token['token_str'] for token in super_weight_analysis['top_tokens']['top_boosted'][:20])
-        sw_top_tokens.update(token['token_str'] for token in super_weight_analysis['top_tokens']['top_suppressed'][:20])
-        
-        overlapping_tokens = neuron_top_tokens.intersection(sw_top_tokens)
-        token_overlap_ratio = len(overlapping_tokens) / len(neuron_top_tokens.union(sw_top_tokens)) if neuron_top_tokens.union(sw_top_tokens) else 0.0
-        
-        # Determine relationship strength
-        if correlation > 0.8 and classification_match:
-            relationship = "strong_alignment"
-            description = "Super weight strongly represents the neuron's function"
-        elif correlation > 0.5:
-            relationship = "moderate_alignment" 
-            description = "Super weight partially represents the neuron's function"
-        elif correlation > 0.0:
-            relationship = "weak_alignment"
-            description = "Super weight is a minor component of the neuron's function"
-        else:
-            relationship = "different_function"
-            description = "Super weight and neuron have different or opposing functions"
-        
-        return {
-            'comparison_type': 'neuron_vs_super_weight',
-            'super_weight': super_weight,
-            'neuron_analysis': neuron_analysis,
-            'super_weight_analysis': super_weight_analysis,
-            'comparison_metrics': {
-                'correlation': correlation,
-                'cosine_similarity': cosine_sim,
-                'magnitude_ratio': magnitude_ratio,
-                'stats_comparison': stats_comparison,
-                'classification_match': classification_match,
-                'token_overlap_ratio': token_overlap_ratio,
-                'overlapping_tokens': list(overlapping_tokens)
-            },
-            'relationship': {
-                'type': relationship,
-                'description': description,
-                'confidence': abs(correlation)  # Use correlation as confidence measure
-            },
-            'summary': {
-                'neuron_classification': neuron_class,
-                'super_weight_classification': sw_class,
-                'alignment_strength': correlation,
-                'super_weight_contribution': f"{magnitude_ratio:.1%}"
-            }
-        }
-
-    def _get_layer(self, layer_idx: int):
-        """Get layer by index using universal handler"""
-        layers = self.mlp_handler.registry.find_layers(self.model)
-        return layers[layer_idx]
-
-    def _get_mlp_component_info(self, layer_idx: int):
-        """Get MLP component info using universal handler"""
-        # Get architecture info and components
-        arch_info = self.mlp_handler.get_mlp_architecture(layer_idx)
-        components = self.mlp_handler.get_mlp_components(layer_idx)
-        
-        # Find the down/output projection component
-        if 'down' in components:
-            # Gated architecture
-            down_component = components['down']
-            down_info = arch_info.components['down']
-            mlp_base = self.mlp_handler.registry.find_mlp(self.mlp_handler.layers[layer_idx])
-            return down_component.weight, down_info.component_name
-        elif 'output' in components:
-            # Standard architecture  
-            output_component = components['output']
-            output_info = arch_info.components['output']
-            mlp_base = self.mlp_handler.registry.find_mlp(self.mlp_handler.layers[layer_idx])
-            return output_component.weight, output_info.component_name
-        else:
-            raise ValueError(f"No down/output projection found in layer {layer_idx}")
-
-    def _get_unembedding_matrix(self) -> torch.Tensor:
-        """Get the unembedding matrix (lm_head or output projection)"""
-        # Try common names for the final projection layer
+        # Find unembedding matrix
         if hasattr(self.model, 'lm_head'):
-            return self.model.lm_head.weight
+            unembedding_weight = self.model.lm_head.weight.detach()
         elif hasattr(self.model, 'output'):
-            return self.model.output.weight
-        elif hasattr(self.model, 'head'):
-            return self.model.head.weight
+            unembedding_weight = self.model.output.weight.detach()
         else:
-            # Search for it in the model
-            for name, module in self.model.named_modules():
-                if isinstance(module, nn.Linear) and module.weight.shape[0] == self.model.config.vocab_size:
-                    return module.weight
             raise ValueError("Could not find unembedding matrix")
-
-    def display_neuron_vs_super_weight_comparison(self, comparison_results: Dict[str, Any]) -> None:
-        """
-        Display comparison results in a readable format.
         
-        Args:
-            comparison_results: Results from compare_neuron_vs_super_weight()
-        """
+        if not apply_universal_neurons_processing:
+            self._cached_unembedding = unembedding_weight
+            self._cache_processed = cache_key
+            return unembedding_weight
         
-        if 'error' in comparison_results:
-            print(f"❌ Comparison failed: {comparison_results['error']}")
-            return
+        # Apply paper-faithful preprocessing: mean-center rows to remove softmax translation bias
+        processed_matrix = unembedding_weight.clone()
+        vocab_mean = processed_matrix.mean(dim=0, keepdim=True)
+        processed_matrix = processed_matrix - vocab_mean
         
-        sw = comparison_results['super_weight']
-        metrics = comparison_results['comparison_metrics']
-        relationship = comparison_results['relationship']
-        summary = comparison_results['summary']
+        # Cache the result
+        self._cached_unembedding = processed_matrix
+        self._cache_processed = cache_key
         
-        print(f"\n{'='*60}")
-        print(f"NEURON vs SUPER WEIGHT COMPARISON: {sw}")
-        print(f"{'='*60}")
-        
-        # Summary
-        print(f"\n📊 SUMMARY:")
-        print(f"  Neuron function: {summary['neuron_classification']}")
-        print(f"  Super weight function: {summary['super_weight_classification']}")
-        print(f"  Alignment strength: {summary['alignment_strength']:.3f}")
-        print(f"  Super weight contribution: {summary['super_weight_contribution']}")
-        
-        # Relationship
-        print(f"\n🔗 RELATIONSHIP:")
-        print(f"  Type: {relationship['type']}")
-        print(f"  Description: {relationship['description']}")
-        print(f"  Confidence: {relationship['confidence']:.3f}")
-        
-        # Detailed metrics
-        print(f"\n📈 DETAILED METRICS:")
-        print(f"  Correlation: {metrics['correlation']:.3f}")
-        print(f"  Cosine similarity: {metrics['cosine_similarity']:.3f}")
-        print(f"  Magnitude ratio: {metrics['magnitude_ratio']:.3f}")
-        print(f"  Classification match: {metrics['classification_match']}")
-        print(f"  Token overlap: {metrics['token_overlap_ratio']:.1%}")
-        
-        # Statistical differences
-        stats_comp = metrics['stats_comparison']
-        print(f"\n📊 STATISTICAL COMPARISON:")
-        print(f"  Kurtosis ratio (SW/Neuron): {stats_comp['kurtosis_ratio']:.2f}")
-        print(f"  Skew difference (SW - Neuron): {stats_comp['skew_difference']:.2f}")
-        print(f"  Std ratio (SW/Neuron): {stats_comp['std_ratio']:.2f}")
-        print(f"  Mean difference (SW - Neuron): {stats_comp['mean_difference']:.3f}")
-        
-        # Overlapping tokens
-        if metrics['overlapping_tokens']:
-            print(f"\n🎯 OVERLAPPING TOP TOKENS:")
-            overlapping = metrics['overlapping_tokens'][:10]  # Show first 10
-            print(f"  {', '.join(repr(token) for token in overlapping)}")
-            if len(metrics['overlapping_tokens']) > 10:
-                print(f"  ... and {len(metrics['overlapping_tokens']) - 10} more")
-        else:
-            print(f"\n🎯 NO OVERLAPPING TOP TOKENS")
-        
-        print(f"\n{'-'*60}")
+        return processed_matrix
     
-    def analyze_vocabulary_cascade(self, super_weight: SuperWeight, 
-                                 input_text: str = "Apple Inc. is a tech company.",
-                                 method: str = "residual_stream") -> Dict[str, Any]:
+    def _capture_residual_layers(self, tokens: torch.Tensor, num_layers: int = 5) -> tuple[List[torch.Tensor], List[int]]:
         """
-        Analyze vocabulary effects throughout the cascade.
+        Capture residual stream activations at evenly spaced layers.
         
-        Args:
-            super_weight: SuperWeight to analyze
-            input_text: Text to analyze
-            method: 'full_projection', 'residual_stream'
-            
         Returns:
-            Dictionary with cascade analysis results
+            Tuple of (residuals, layer_indices) so caller knows which layers were actually captured
         """
-        
-        print(f"Running cascade analysis using {method} method...")
-        
-        if method == "full_projection":
-            return self.analyze_activation_cascade(super_weight, input_text)
-        elif method == "residual_stream":
-            return self.analyze_residual_stream_cascade(super_weight, input_text)
-        else:
-            raise ValueError(f"Unknown method: {method}")
-
-    def analyze_activation_cascade(self, super_weight: SuperWeight, 
-                                 input_text: str = "Apple Inc. is a tech company.") -> Dict[str, Any]:
-        """
-        Analyze how super weight affects activations at each layer using full projection.
-        Projects each intermediate activation through remaining layers to get final logits.
-        """
-        
-        try:
-            # Get baseline activations through all layers
-            print("Capturing baseline activations...")
-            baseline_activations = self._capture_all_layer_activations(input_text)
-            
-            # Get modified activations with super weight zeroed
-            print("Capturing modified activations...")
-            with self.manager.temporary_zero([super_weight]):
-                modified_activations = self._capture_all_layer_activations(input_text)
-            
-            cascade_effects = {}
-            num_layers = len(baseline_activations)
-            
-            print(f"Projecting activations through {num_layers} layers...")
-            
-            for layer_idx in range(num_layers):
-                print(f"  Processing layer {layer_idx}/{num_layers-1}", end='\r')
-                
-                # Compute activation difference at this layer
-                activation_diff = baseline_activations[layer_idx] - modified_activations[layer_idx]
-                
-                # Project through remaining layers to get final logits
-                projected_baseline = self._project_to_final_logits(baseline_activations[layer_idx], layer_idx)
-                projected_modified = self._project_to_final_logits(modified_activations[layer_idx], layer_idx)
-                
-                logit_effect = projected_baseline - projected_modified
-                
-                # Analyze the effects
-                statistics = self._compute_effect_statistics(logit_effect)
-                top_tokens = self._get_top_affected_tokens(logit_effect, top_k=10)
-                
-                cascade_effects[layer_idx] = {
-                    'activation_magnitude': float(torch.norm(activation_diff)),
-                    'vocab_effect': logit_effect.numpy(),
-                    'statistics': statistics,
-                    'top_tokens': top_tokens,
-                    'effect_magnitude': float(torch.norm(logit_effect)),
-                    'layers_remaining': num_layers - layer_idx - 1
-                }
-            
-            print()  # New line after progress
-            
-            # Analyze propagation patterns
-            propagation_analysis = self._analyze_effect_propagation(cascade_effects)
-            convergence_analysis = self._analyze_vocabulary_convergence(cascade_effects)
-            
-            return {
-                'analysis_type': 'full_projection',
-                'super_weight': super_weight,
-                'input_text': input_text,
-                'cascade_effects': cascade_effects,
-                'propagation_analysis': propagation_analysis,
-                'convergence_analysis': convergence_analysis,
-                'summary': self._create_cascade_summary(cascade_effects, 'full_projection')
-            }
-            
-        except Exception as e:
-            return {
-                'analysis_type': 'full_projection',
-                'super_weight': super_weight,
-                'error': f"Full projection analysis failed: {str(e)}"
-            }
-
-    def analyze_residual_stream_cascade(self, super_weight: SuperWeight, 
-                                      input_text: str = "Apple Inc. is a tech company.") -> Dict[str, Any]:
-        """
-        Analyze cascading effects through residual stream.
-        Shows how super weight effects accumulate through residual connections.
-        """
-        
-        try:
-            print("Capturing residual stream...")
-            
-            # Capture residual stream at each layer
-            baseline_residuals = self._capture_residual_stream(input_text)
-            
-            with self.manager.temporary_zero([super_weight]):
-                modified_residuals = self._capture_residual_stream(input_text)
-            
-            residual_effects = {}
-            cumulative_effect = torch.zeros(self.model.config.vocab_size)
-            
-            print(f"Analyzing residual differences across {len(baseline_residuals)} layers...")
-            
-            for layer_idx, (baseline_res, modified_res) in enumerate(zip(baseline_residuals, modified_residuals)):
-                print(f"  Processing layer {layer_idx}/{len(baseline_residuals)-1}", end='\r')
-                
-                # Residual difference at this layer
-                residual_diff = baseline_res - modified_res
-                
-                # Project this specific difference to vocabulary space
-                # Get unembedding matrix
-                if hasattr(self.model, 'lm_head'):
-                    unembedding_matrix = self.model.lm_head.weight
-                elif hasattr(self.model, 'embed_out'):
-                    unembedding_matrix = self.model.embed_out.weight
-                else:
-                    unembedding_matrix = self.model.model.embed_tokens.weight
-                
-                # Ensure both tensors are on the same device
-                residual_diff = residual_diff.to(unembedding_matrix.device)
-                layer_vocab_effect = safe_matmul(residual_diff, unembedding_matrix.T, result_device='cpu')
-                
-                # Accumulate effects
-                cumulative_effect += layer_vocab_effect
-                
-                # Analyze this layer's effects
-                statistics = self._compute_effect_statistics(layer_vocab_effect)
-                top_tokens = self._get_top_affected_tokens(layer_vocab_effect, top_k=10)
-                
-                residual_effects[layer_idx] = {
-                    'residual_magnitude': float(torch.norm(residual_diff)),
-                    'direct_vocab_effect': layer_vocab_effect.detach().numpy(),
-                    'cumulative_vocab_effect': cumulative_effect.clone().detach().numpy(),
-                    'statistics': statistics,
-                    'top_tokens': top_tokens,
-                    'effect_magnitude': float(torch.norm(layer_vocab_effect)),
-                    'cumulative_magnitude': float(torch.norm(cumulative_effect)),
-                    'amplification_factor': float(torch.norm(layer_vocab_effect) / torch.norm(residual_diff)) if torch.norm(residual_diff) > 0 else 0.0
-                }
-            
-            print()  # New line after progress
-            
-            # Analyze accumulation patterns
-            accumulation_analysis = self._analyze_effect_accumulation(residual_effects)
-            amplification_analysis = self._analyze_amplification_patterns(residual_effects)
-            
-            return {
-                'analysis_type': 'residual_stream',
-                'super_weight': super_weight,
-                'input_text': input_text,
-                'residual_effects': residual_effects,
-                'accumulation_analysis': accumulation_analysis,
-                'amplification_analysis': amplification_analysis,
-                'summary': self._create_cascade_summary(residual_effects, 'residual_stream')
-            }
-            
-        except Exception as e:
-            return {
-                'analysis_type': 'residual_stream',
-                'super_weight': super_weight,
-                'error': f"Residual stream analysis failed: {str(e)}"
-            }
-
-    def _capture_all_layer_activations(self, input_text: str) -> List[torch.Tensor]:
-        """Capture activations at each layer using universal architecture utilities"""
-        
-        activations = []
-        
-        # Tokenize input
-        tokens = self.tokenizer(input_text, return_tensors='pt').to(self.model.device)
-        
-        # Hook function to capture activations
-        def capture_activation(module, input_tensor, output_tensor):
-            try:
-                # Handle different output formats safely
-                if output_tensor is None:
-                    return
-                    
-                if isinstance(output_tensor, tuple):
-                    activation = output_tensor[0]  # First element is usually the main output
-                else:
-                    activation = output_tensor
-                
-                if activation is None:
-                    return
-                
-                # Take the last token's activation and ensure it's detached
-                last_token_activation = activation[0, -1, :].detach().cpu()
-                activations.append(last_token_activation)
-                
-            except Exception as e:
-                print(f"Warning: Could not capture activation: {e}")
-                # Add a zero tensor as placeholder
-                if activations:
-                    # Use same size as previous activation
-                    activations.append(torch.zeros_like(activations[-1]))
-                else:
-                    # Fallback zero tensor
-                    activations.append(torch.zeros(self.model.config.hidden_size))
-        
-        # Register hooks using universal architecture utilities
-        hooks = []
-        layers = self.mlp_handler.registry.find_layers(self.model)
-        
-        for layer in layers:
-            hook = layer.register_forward_hook(capture_activation)
-            hooks.append(hook)
-        
-        try:
-            # Run forward pass
-            with torch.no_grad():
-                outputs = self.model(**tokens)
-        finally:
-            # Remove hooks
-            for hook in hooks:
-                hook.remove()
-        
-        return activations
-
-    def _capture_residual_stream(self, input_text: str) -> List[torch.Tensor]:
-        """Capture residual stream at each layer using universal architecture utilities"""
+        total_layers = len(list(self.model.model.layers))
+        layer_indices = [int(i * total_layers / num_layers) for i in range(num_layers)]
         
         residuals = []
         
-        # Tokenize input
-        tokens = self.tokenizer(input_text, return_tensors='pt').to(self.model.device)
+        def capture_residual(layer_idx):
+            def hook_fn(module, input_tensor, output_tensor):
+                if len(residuals) == layer_idx:  # Only capture once per layer
+                    if isinstance(output_tensor, tuple):
+                        residual = output_tensor[0][0, -1, :].detach().cpu()  # Last token
+                    else:
+                        residual = output_tensor[0, -1, :].detach().cpu()
+                    residuals.append(residual)
+            return hook_fn
         
-        # Use a simpler approach: capture layer outputs and treat them as residual approximations
-        # This works universally across architectures without needing model-specific handling
-        print("Capturing residual stream using universal layer capture...")
-        
-        try:
-            # For now, use layer activations as residual stream approximation
-            # This is a reasonable approximation since transformer layers typically
-            # have residual connections where output ≈ input + layer_transform(input)
-            residuals = self._capture_all_layer_activations(input_text)
-            
-            # TODO: In future, could add more sophisticated residual capture
-            # by hooking into specific residual connection points using the
-            # universal architecture registry
-            
-            return residuals
-                
-        except Exception as e:
-            print(f"Warning: Could not capture residual stream ({e}), using fallback...")
-            # Fallback: return layer activations
-            return self._capture_all_layer_activations(input_text)
-
-    def _project_to_final_logits(self, activation: torch.Tensor, from_layer: int) -> torch.Tensor:
-        """Project activation to final logits using direct matrix multiplication"""
+        # Register hooks
+        hooks = []
+        for i, layer_idx in enumerate(layer_indices):
+            layer = self.model.model.layers[layer_idx]
+            hook = layer.register_forward_hook(capture_residual(i))
+            hooks.append(hook)
         
         try:
             with torch.no_grad():
-                # For now, use direct projection through the output head
-                # This is a reasonable approximation for understanding vocabulary effects
-                
-                activation = activation.to(self.model.device)
-                
-                # Apply final layer norm if it exists (this is important for OLMo/LLaMA models)
-                if hasattr(self.model.model, 'norm'):
-                    # Add batch and sequence dimensions for layer norm
-                    x = activation.unsqueeze(0).unsqueeze(0)  # [1, 1, hidden_size]
-                    x = self.model.model.norm(x)
-                    activation = x[0, 0, :]  # Remove dimensions
-                elif hasattr(self.model, 'ln_f'):
-                    x = activation.unsqueeze(0).unsqueeze(0)
-                    x = self.model.ln_f(x)
-                    activation = x[0, 0, :]
-                
-                # Project to vocabulary space - NEED SAFE_MATMUL HERE
-                if hasattr(self.model, 'lm_head'):
-                    logits = safe_matmul(activation, self.model.lm_head.weight.T, result_device='cpu')
-                elif hasattr(self.model, 'embed_out'):
-                    logits = safe_matmul(activation, self.model.embed_out.weight.T, result_device='cpu')
-                elif hasattr(self.model.model, 'embed_tokens'):
-                    # Use embedding matrix transpose (tied weights)
-                    logits = safe_matmul(activation, self.model.model.embed_tokens.weight.T, result_device='cpu')
-                else:
-                    # Last resort: zero logits
-                    logits = torch.zeros(self.model.config.vocab_size, device=activation.device)
-                
-                return logits.cpu()
-            
-        except Exception as e:
-            print(f"Error in direct projection: {e}")
-            # Return zero logits as ultimate fallback
-            return torch.zeros(self.model.config.vocab_size)
-
-    def _analyze_effect_propagation(self, cascade_effects: Dict) -> Dict[str, Any]:
-        """Analyze how effects propagate and amplify through layers"""
+                outputs = self.model(**tokens)
+        finally:
+            for hook in hooks:
+                hook.remove()
         
-        layer_indices = sorted(cascade_effects.keys())
-        magnitudes = [cascade_effects[i]['effect_magnitude'] for i in layer_indices]
-        activation_magnitudes = [cascade_effects[i]['activation_magnitude'] for i in layer_indices]
+        return residuals, layer_indices
+    
+    def _classify_cascade_pattern(self, layer_effects: Dict) -> str:
+        """Classify the amplification pattern of effects across layers"""
+        entropies = [effects['entropy_change'] for effects in layer_effects.values()]
         
-        # Classify propagation pattern
-        if magnitudes[-1] > magnitudes[0] * 2:
-            pattern = "amplifying"
-        elif magnitudes[-1] < magnitudes[0] * 0.5:
-            pattern = "dampening"
+        if all(e > 0 for e in entropies):
+            return "amplifying"
+        elif all(e < 0 for e in entropies):
+            return "dampening"
+        elif abs(entropies[-1]) > abs(entropies[0]) * 2:
+            return "accelerating"
         else:
-            pattern = "stable"
+            return "stable"
+    
+    def _get_random_coordinate_same_magnitude(self, super_weight: SuperWeight) -> SuperWeight:
+        """Generate a random coordinate with similar magnitude for baseline comparison"""
+        components = self.mlp_handler.get_mlp_components(super_weight.layer)
+        down_proj = components['down']
         
-        # Find critical layers (where effects change significantly)
-        critical_layers = []
-        for i in range(1, len(magnitudes)):
-            change_ratio = magnitudes[i] / magnitudes[i-1] if magnitudes[i-1] > 0 else float('inf')
-            if change_ratio > 2.0 or change_ratio < 0.5:
-                critical_layers.append(layer_indices[i])
+        # Find coordinate with similar magnitude
+        target_magnitude = abs(super_weight.original_value)
+        weight_matrix = down_proj.weight.abs()
         
-        return {
-            'propagation_pattern': pattern,
-            'magnitude_trajectory': magnitudes,
-            'activation_trajectory': activation_magnitudes,
-            'critical_layers': critical_layers,
-            'amplification_ratio': magnitudes[-1] / magnitudes[0] if magnitudes[0] > 0 else 0.0,
-            'peak_layer': layer_indices[magnitudes.index(max(magnitudes))]
-        }
-
-    def _analyze_vocabulary_convergence(self, cascade_effects: Dict) -> Dict[str, Any]:
-        """Check if vocabulary effects converge to the final effect"""
+        # Find all weights within 10% of target magnitude
+        close_weights = torch.where(
+            torch.abs(weight_matrix - target_magnitude) < target_magnitude * 0.1
+        )
         
-        layer_indices = sorted(cascade_effects.keys())
-        final_effect = torch.tensor(cascade_effects[layer_indices[-1]]['vocab_effect'])
+        if len(close_weights[0]) == 0:
+            # Fallback: any random coordinate
+            random_row = torch.randint(0, weight_matrix.shape[0], (1,)).item()
+            random_col = torch.randint(0, weight_matrix.shape[1], (1,)).item()
+        else:
+            # Pick random from magnitude-matched coordinates
+            idx = torch.randint(0, len(close_weights[0]), (1,)).item()
+            random_row = close_weights[0][idx].item()
+            random_col = close_weights[1][idx].item()
         
-        convergence_scores = {}
-        stable_tokens = set()
+        return SuperWeight(
+            layer=super_weight.layer,
+            row=random_row,
+            column=random_col,
+            original_value=down_proj.weight[random_row, random_col].item(),
+            component="down_proj",
+            iteration_found=-1,  # We don't care about the iteration or input/output values
+            input_value=-1,
+            output_value=-1
+        )
+    
+    def _compare_neuron_vs_scalar_ablation(self, super_weight: SuperWeight, 
+                                         test_texts: List[str]) -> Dict[str, Any]:
+        """Compare full neuron ablation vs single scalar ablation"""
+        # Single scalar ablation
+        scalar_effect = self.analyze_super_weight_intervention(super_weight, test_texts)
         
-        for layer_idx in layer_indices:
-            layer_effect = torch.tensor(cascade_effects[layer_idx]['vocab_effect'])
-            
-            # Cosine similarity with final effect
-            similarity = torch.cosine_similarity(layer_effect, final_effect, dim=0).item()
-            convergence_scores[layer_idx] = similarity
-            
-            # Check for stable top tokens
-            if similarity > 0.8:
-                layer_top_tokens = set(token['token_str'] for token in cascade_effects[layer_idx]['top_tokens']['top_boosted'][:10])
-                if not stable_tokens:
-                    stable_tokens = layer_top_tokens
-                else:
-                    stable_tokens = stable_tokens.intersection(layer_top_tokens)
-        
-        # Find convergence point (where similarity > 0.9)
-        convergence_layer = None
-        for layer_idx in layer_indices:
-            if convergence_scores[layer_idx] > 0.9:
-                convergence_layer = layer_idx
-                break
+        # Full neuron ablation (zero entire column)
+        neuron_effect = self._analyze_full_neuron_ablation(super_weight, test_texts)
         
         return {
-            'convergence_scores': convergence_scores,
-            'convergence_layer': convergence_layer,
-            'stable_tokens': list(stable_tokens),
-            'final_similarity': convergence_scores[layer_indices[-1]] if layer_indices else 0.0
-        }
-
-    def _analyze_effect_accumulation(self, residual_effects: Dict) -> Dict[str, Any]:
-        """Analyze how effects accumulate in residual stream"""
-        
-        layer_indices = sorted(residual_effects.keys())
-        cumulative_magnitudes = [residual_effects[i]['cumulative_magnitude'] for i in layer_indices]
-        direct_magnitudes = [residual_effects[i]['effect_magnitude'] for i in layer_indices]
-        
-        # Find layers with significant contributions
-        significant_layers = []
-        for i, layer_idx in enumerate(layer_indices):
-            if direct_magnitudes[i] > max(direct_magnitudes) * 0.1:  # > 10% of max
-                significant_layers.append(layer_idx)
-        
-        # Analyze accumulation pattern
-        growth_rates = []
-        for i in range(1, len(cumulative_magnitudes)):
-            if cumulative_magnitudes[i-1] > 0:
-                rate = cumulative_magnitudes[i] / cumulative_magnitudes[i-1]
-                growth_rates.append(rate)
-        
-        avg_growth_rate = np.mean(growth_rates) if growth_rates else 1.0
-        
-        return {
-            'accumulation_pattern': 'linear' if 0.9 <= avg_growth_rate <= 1.1 else 'non_linear',
-            'cumulative_trajectory': cumulative_magnitudes,
-            'direct_contributions': direct_magnitudes,
-            'significant_layers': significant_layers,
-            'total_accumulation': cumulative_magnitudes[-1] if cumulative_magnitudes else 0.0,
-            'average_growth_rate': avg_growth_rate
-        }
-
-    def _analyze_amplification_patterns(self, residual_effects: Dict) -> Dict[str, Any]:
-        """Analyze amplification factors across layers"""
-        
-        layer_indices = sorted(residual_effects.keys())
-        amplification_factors = [residual_effects[i]['amplification_factor'] for i in layer_indices]
-        
-        # Find highly amplifying layers
-        high_amplification = [layer_indices[i] for i, factor in enumerate(amplification_factors) if factor > 2.0]
-        
-        # Find dampening layers
-        dampening = [layer_indices[i] for i, factor in enumerate(amplification_factors) if factor < 0.5]
-        
-        return {
-            'amplification_factors': amplification_factors,
-            'average_amplification': np.mean(amplification_factors),
-            'max_amplification': max(amplification_factors) if amplification_factors else 0.0,
-            'high_amplification_layers': high_amplification,
-            'dampening_layers': dampening,
-            'amplification_pattern': 'amplifying' if np.mean(amplification_factors) > 1.0 else 'dampening'
-        }
-
-    def _create_cascade_summary(self, effects: Dict, analysis_type: str) -> Dict[str, Any]:
-        """Create summary of cascade analysis"""
-        
-        layer_indices = sorted(effects.keys())
-        
-        if analysis_type == 'full_projection':
-            magnitudes = [effects[i]['effect_magnitude'] for i in layer_indices]
-            key_metric = 'effect_magnitude'
-        else:  # residual_stream
-            magnitudes = [effects[i]['cumulative_magnitude'] for i in layer_indices]
-            key_metric = 'cumulative_magnitude'
-        
-        peak_layer = layer_indices[magnitudes.index(max(magnitudes))]
-        final_magnitude = magnitudes[-1] if magnitudes else 0.0
-        
-        return {
-            'analysis_type': analysis_type,
-            'total_layers_analyzed': len(layer_indices),
-            'peak_effect_layer': peak_layer,
-            'final_effect_magnitude': final_magnitude,
-            'magnitude_range': [min(magnitudes), max(magnitudes)] if magnitudes else [0.0, 0.0],
-            'effect_evolution': 'increasing' if magnitudes[-1] > magnitudes[0] else 'decreasing'
+            'scalar_delta_loss': scalar_effect['delta_loss'],
+            'neuron_delta_loss': neuron_effect['delta_loss'],
+            'scalar_contribution_ratio': abs(scalar_effect['delta_loss']) / max(abs(neuron_effect['delta_loss']), 1e-6)
         }
     
-    def display_cascade_analysis(self, cascade_results: Dict[str, Any], top_k: int = 5) -> None:
-        """
-        Display cascade analysis results in a readable format.
+    def _analyze_full_neuron_ablation(self, super_weight: SuperWeight, test_texts: List[str]) -> Dict[str, Any]:
+        """Ablate the entire neuron (full column) and measure effects using windowed evaluation"""
+        # Create temporary weights for full neuron ablation
+        components = self.mlp_handler.get_mlp_components(super_weight.layer)
+        down_proj = components['down']
         
-        Args:
-            cascade_results: Results from analyze_vocabulary_cascade()
-            top_k: Number of top tokens to show per layer
-        """
+        # Store original column
+        original_column = down_proj.weight[:, super_weight.column].clone()
         
-        if 'error' in cascade_results:
-            print(f"❌ Cascade analysis failed: {cascade_results['error']}")
-            return
-        
-        analysis_type = cascade_results['analysis_type']
-        sw = cascade_results['super_weight']
-        summary = cascade_results['summary']
-        
-        print(f"\n{'='*70}")
-        print(f"CASCADE ANALYSIS ({analysis_type.upper()}): {sw}")
-        print(f"{'='*70}")
-        
-        # Summary
-        print(f"\n📊 SUMMARY:")
-        print(f"  Analysis type: {analysis_type}")
-        print(f"  Layers analyzed: {summary['total_layers_analyzed']}")
-        print(f"  Peak effect at layer: {summary['peak_effect_layer']}")
-        print(f"  Final magnitude: {summary['final_effect_magnitude']:.4f}")
-        print(f"  Effect evolution: {summary['effect_evolution']}")
-        
-        # Analysis-specific results
-        if analysis_type == 'full_projection':
-            self._display_full_projection_results(cascade_results, top_k)
-        elif analysis_type == 'residual_stream':
-            self._display_residual_stream_results(cascade_results, top_k)
-        
-        print(f"\n{'-'*70}")
-
-    def _display_full_projection_results(self, results: Dict[str, Any], top_k: int) -> None:
-        """Display full projection specific results"""
-        
-        cascade_effects = results['cascade_effects']
-        propagation = results['propagation_analysis']
-        convergence = results['convergence_analysis']
-        
-        print(f"\n🔄 PROPAGATION ANALYSIS:")
-        print(f"  Pattern: {propagation['propagation_pattern']}")
-        print(f"  Amplification ratio: {propagation['amplification_ratio']:.3f}")
-        print(f"  Peak layer: {propagation['peak_layer']}")
-        print(f"  Critical layers: {propagation['critical_layers']}")
-        
-        print(f"\n🎯 CONVERGENCE ANALYSIS:")
-        print(f"  Convergence layer: {convergence['convergence_layer']}")
-        print(f"  Final similarity: {convergence['final_similarity']:.3f}")
-        if convergence['stable_tokens']:
-            print(f"  Stable tokens: {', '.join(repr(token) for token in convergence['stable_tokens'][:10])}")
-        
-        # Show key layers
-        key_layers = [0, propagation['peak_layer'], max(cascade_effects.keys())]
-        key_layers = sorted(list(set(key_layers)))  # Remove duplicates and sort
-        
-        print(f"\n📈 KEY LAYERS ANALYSIS:")
-        for layer_idx in key_layers:
-            if layer_idx in cascade_effects:
-                effects = cascade_effects[layer_idx]
-                print(f"\n  Layer {layer_idx}:")
-                print(f"    Effect magnitude: {effects['effect_magnitude']:.4f}")
-                print(f"    Activation magnitude: {effects['activation_magnitude']:.4f}")
-                print(f"    Layers remaining: {effects['layers_remaining']}")
-                
-                # Top boosted tokens
-                top_boosted = effects['top_tokens']['top_boosted'][:top_k]
-                if top_boosted:
-                    tokens_str = ', '.join(f"{repr(t['token_str'])}({t['effect_magnitude']:+.2f})" for t in top_boosted)
-                    print(f"    Top boosted: {tokens_str}")
-
-    def _display_residual_stream_results(self, results: Dict[str, Any], top_k: int) -> None:
-        """Display residual stream specific results"""
-        
-        residual_effects = results['residual_effects']
-        accumulation = results['accumulation_analysis']
-        amplification = results['amplification_analysis']
-        
-        print(f"\n📈 ACCUMULATION ANALYSIS:")
-        print(f"  Pattern: {accumulation['accumulation_pattern']}")
-        print(f"  Total accumulation: {accumulation['total_accumulation']:.4f}")
-        print(f"  Average growth rate: {accumulation['average_growth_rate']:.3f}")
-        print(f"  Significant layers: {accumulation['significant_layers']}")
-        
-        print(f"\n🔊 AMPLIFICATION ANALYSIS:")
-        print(f"  Pattern: {amplification['amplification_pattern']}")
-        print(f"  Average amplification: {amplification['average_amplification']:.3f}")
-        print(f"  Max amplification: {amplification['max_amplification']:.3f}")
-        print(f"  High amplification layers: {amplification['high_amplification_layers']}")
-        print(f"  Dampening layers: {amplification['dampening_layers']}")
-        
-        # Show significant contributing layers
-        significant_layers = accumulation['significant_layers'][:5]  # Top 5
-        
-        print(f"\n📊 SIGNIFICANT LAYERS:")
-        for layer_idx in significant_layers:
-            if layer_idx in residual_effects:
-                effects = residual_effects[layer_idx]
-                print(f"\n  Layer {layer_idx}:")
-                print(f"    Direct effect: {effects['effect_magnitude']:.4f}")
-                print(f"    Cumulative effect: {effects['cumulative_magnitude']:.4f}")
-                print(f"    Amplification factor: {effects['amplification_factor']:.3f}")
-                print(f"    Residual magnitude: {effects['residual_magnitude']:.4f}")
-                
-                # Top affected tokens for this layer
-                top_boosted = effects['top_tokens']['top_boosted'][:top_k]
-                if top_boosted:
-                    tokens_str = ', '.join(f"{repr(t['token_str'])}({t['effect_magnitude']:+.2f})" for t in top_boosted)
-                    print(f"    Top boosted: {tokens_str}")
-
-    def compare_cascade_methods(self, super_weight: SuperWeight, 
-                              input_text: str = "Apple Inc. is a tech company.") -> Dict[str, Any]:
-        """
-        Compare results from both cascade analysis methods.
-        
-        Args:
-            super_weight: SuperWeight to analyze
-            input_text: Text to analyze with both methods
+        try:
+            # Zero entire column
+            down_proj.weight[:, super_weight.column] = 0
             
-        Returns:
-            Dictionary with comparison results
-        """
-        
-        print(f"Running cascade method comparison for {super_weight}...")
-        
-        # Run both analyses
-        full_projection = self.analyze_vocabulary_cascade(super_weight, input_text, "full_projection")
-        residual_stream = self.analyze_vocabulary_cascade(super_weight, input_text, "residual_stream")
-        
-        # Check for errors
-        if 'error' in full_projection or 'error' in residual_stream:
+            # Measure effects using windowed evaluation
+            metrics = self._eval_windows(test_texts)
+            
             return {
-                'super_weight': super_weight,
-                'full_projection': full_projection,
-                'residual_stream': residual_stream,
-                'comparison_error': "One or both analyses failed"
+                'delta_loss': metrics['loss'], 
+                'delta_entropy': metrics['entropy'],
+                'delta_topk_margin': metrics['topk_margin'],
+                'delta_stopword_mass': metrics['stopword_mass']
             }
-        
-        # Compare final effects
-        fp_final = torch.tensor(full_projection['cascade_effects'][max(full_projection['cascade_effects'].keys())]['vocab_effect'])
-        rs_final = torch.tensor(residual_stream['residual_effects'][max(residual_stream['residual_effects'].keys())]['cumulative_vocab_effect'])
-        
-        # Compute similarity between final effects
-        final_correlation = torch.corrcoef(torch.stack([fp_final, rs_final]))[0, 1].item()
-        final_cosine_sim = torch.cosine_similarity(fp_final, rs_final, dim=0).item()
-        
-        # Compare magnitude trajectories
-        fp_magnitudes = [full_projection['cascade_effects'][i]['effect_magnitude'] 
-                        for i in sorted(full_projection['cascade_effects'].keys())]
-        rs_magnitudes = [residual_stream['residual_effects'][i]['cumulative_magnitude'] 
-                        for i in sorted(residual_stream['residual_effects'].keys())]
-        
-        # Align trajectories (in case different number of layers)
-        min_len = min(len(fp_magnitudes), len(rs_magnitudes))
-        fp_aligned = fp_magnitudes[:min_len]
-        rs_aligned = rs_magnitudes[:min_len]
-        
-        magnitude_correlation = np.corrcoef(fp_aligned, rs_aligned)[0, 1] if min_len > 1 else 0.0
+            
+        finally:
+            # Restore original weights
+            down_proj.weight[:, super_weight.column] = original_column
+    
+    def _verify_deterministic_noop(self, super_weight: SuperWeight, test_texts: List[str]) -> Dict[str, Any]:
+        """Verify deterministic model behavior by running identical computations twice using windowed evaluation"""
+        # Run twice with identical conditions
+        metrics1 = self._eval_windows(test_texts)
+        metrics2 = self._eval_windows(test_texts)
         
         return {
-            'super_weight': super_weight,
-            'input_text': input_text,
-            'full_projection': full_projection,
-            'residual_stream': residual_stream,
-            'comparison_metrics': {
-                'final_effects_correlation': final_correlation,
-                'final_effects_cosine_similarity': final_cosine_sim,
-                'magnitude_trajectory_correlation': magnitude_correlation,
-                'fp_final_magnitude': float(torch.norm(fp_final)),
-                'rs_final_magnitude': float(torch.norm(rs_final))
-            },
-            'summary': {
-                'methods_agree': final_correlation > 0.7,
-                'preferred_method': 'full_projection' if torch.norm(fp_final) > torch.norm(rs_final) else 'residual_stream',
-                'consistency_score': (final_correlation + magnitude_correlation) / 2
-            }
+            'loss_difference': abs(metrics1['loss'] - metrics2['loss']),
+            'entropy_difference': abs(metrics1['entropy'] - metrics2['entropy']),
+            'topk_margin_difference': abs(metrics1['topk_margin'] - metrics2['topk_margin']),
+            'is_deterministic': abs(metrics1['loss'] - metrics2['loss']) < 1e-6
         }
 
-    def display_cascade_comparison(self, comparison_results: Dict[str, Any]) -> None:
-        """Display cascade method comparison results"""
+    def display_vocabulary_card(self, analysis_results: Dict[str, Any], top_k_display: int = 5) -> None:
+        """
+        Display comprehensive vocabulary analysis results in a readable format
         
-        if 'comparison_error' in comparison_results:
-            print(f"❌ Comparison failed: {comparison_results['comparison_error']}")
-            return
+        Args:
+            analysis_results: Results from analyze_neuron_vocabulary_effects
+            top_k_display: Number of top boosted/suppressed tokens to display
+        """
+        sw = analysis_results['super_weight']
         
-        sw = comparison_results['super_weight']
-        metrics = comparison_results['comparison_metrics']
-        summary = comparison_results['summary']
+        print(f"=== Vocabulary Effect Card: {sw} ===")
+        print(f"Processing applied: {analysis_results.get('processing_applied', 'Unknown')}")
         
-        print(f"\n{'='*60}")
-        print(f"CASCADE METHODS COMPARISON: {sw}")
-        print(f"{'='*60}")
+        # Display raw analysis
+        if 'raw_analysis' in analysis_results:
+            raw = analysis_results['raw_analysis']
+            stats = raw['statistics']
+            classification = raw['classification']
+            enrichment = raw['enrichment']
+            top_tokens = raw['top_tokens']
+            
+            print(f"\n--- Raw Dot Product Analysis ---")
+            print(f"Classification: {classification['type'].upper()} ({classification['confidence']:.2f})")
+            print(f"  {classification['description']}")
+            print(f"Moments: var={stats['variance']:.3f}, skew={stats['skew']:.2f}, kurt={stats['kurtosis']:.2f}")
+            print(f"Percentiles: p5={stats['percentiles']['p5']:.3f}, p50={stats['percentiles']['p50']:.3f}, p95={stats['percentiles']['p95']:.3f}")
+            print(f"Best theme: {enrichment['best_theme']['class']} (score: {enrichment['best_theme']['score']:.3f})")
+            
+            print(f"Top {top_k_display} boosted:")
+            for i, token in enumerate(top_tokens['top_boosted'][:top_k_display]):
+                print(f"  {i+1}. {repr(token['token_str'])} ({token['effect_magnitude']:+.3f})")
+            
+            print(f"Top {top_k_display} suppressed:")
+            for i, token in enumerate(top_tokens['top_suppressed'][:top_k_display]):
+                print(f"  {i+1}. {repr(token['token_str'])} ({token['effect_magnitude']:+.3f})")
         
-        print(f"\n📊 COMPARISON METRICS:")
-        print(f"  Final effects correlation: {metrics['final_effects_correlation']:.3f}")
-        print(f"  Final effects cosine similarity: {metrics['final_effects_cosine_similarity']:.3f}")
-        print(f"  Magnitude trajectory correlation: {metrics['magnitude_trajectory_correlation']:.3f}")
-        print(f"  Full projection final magnitude: {metrics['fp_final_magnitude']:.4f}")
-        print(f"  Residual stream final magnitude: {metrics['rs_final_magnitude']:.4f}")
+        # Display cosine analysis
+        if 'cosine_analysis' in analysis_results:
+            cosine = analysis_results['cosine_analysis']
+            cos_stats = cosine['statistics']
+            cos_classification = cosine['classification']
+            
+            print(f"\n--- Cosine Similarity Analysis ---")
+            print(f"Classification: {cos_classification['type'].upper()} ({cos_classification['confidence']:.2f})")
+            print(f"Moments: var={cos_stats['variance']:.3f}, skew={cos_stats['skew']:.2f}, kurt={cos_stats['kurtosis']:.2f}")
+            print(f"Percentiles: p5={cos_stats['percentiles']['p5']:.3f}, p50={cos_stats['percentiles']['p50']:.3f}, p95={cos_stats['percentiles']['p95']:.3f}")
         
-        print(f"\n🎯 SUMMARY:")
-        print(f"  Methods agree: {summary['methods_agree']}")
-        print(f"  Preferred method: {summary['preferred_method']}")
-        print(f"  Consistency score: {summary['consistency_score']:.3f}")
+        # Fallback to legacy format if new structure not available
+        if 'statistics' in analysis_results:
+            stats = analysis_results['statistics']
+            classification = analysis_results['classification']
+            enrichment = analysis_results['enrichment']
+            top_tokens = analysis_results['top_tokens']
+            
+            print(f"Classification: {classification['type'].upper()} ({classification['confidence']:.2f})")
+            print(f"  {classification['description']}")
+            print(f"Moments: var={stats['variance']:.2f}, skew={stats['skew']:.2f}, kurt={stats['kurtosis']:.2f}")
+            print(f"Best theme: {enrichment['best_theme']['class']} (score: {enrichment['best_theme']['score']:.3f})")
+            
+            print(f"Top {top_k_display} boosted:")
+            for i, token in enumerate(top_tokens['top_boosted'][:top_k_display]):
+                print(f"  {i+1}. {repr(token['token_str'])} ({token['effect_magnitude']:+.3f})")
+            
+            print(f"Top {top_k_display} suppressed:")
+            for i, token in enumerate(top_tokens['top_suppressed'][:top_k_display]):
+                print(f"  {i+1}. {repr(token['token_str'])} ({token['effect_magnitude']:+.3f})")
+
+    def display_intervention_results(self, intervention_results: Dict[str, Any]) -> None:
+        """Display intervention analysis results in a readable format"""
+        sw = intervention_results['super_weight']
         
-        print(f"\n💡 INTERPRETATION:")
-        if summary['methods_agree']:
-            print("  ✅ Both methods show consistent results")
-            print("  → Super weight effects are stable across analysis approaches")
+        print(f"=== Intervention Effect Card: {sw} ===")
+        print(f"Loss: {intervention_results['baseline_loss']:.4f} → {intervention_results['modified_loss']:.4f} (Δ{intervention_results['delta_loss']:+.4f})")
+        print(f"Entropy: {intervention_results['baseline_entropy']:.4f} → {intervention_results['modified_entropy']:.4f} (Δ{intervention_results['delta_entropy']:+.4f})")
+        print(f"Top-K Margin: {intervention_results['baseline_topk_margin']:.4f} → {intervention_results['modified_topk_margin']:.4f} (Δ{intervention_results['delta_topk_margin']:+.4f})")
+        
+        if intervention_results['delta_stopword_mass'] is not None:
+            print(f"Stopword Mass: {intervention_results['baseline_stopword_mass']:.4f} → {intervention_results['modified_stopword_mass']:.4f} (Δ{intervention_results['delta_stopword_mass']:+.4f})")
         else:
-            print("  ⚠️  Methods show different results")
-            print("  → Super weight effects may be context-dependent or method-sensitive")
+            print("Stopword Mass: Not available")
         
-        print(f"\n{'-'*60}")
-    
-    def analyze_and_save_vocabulary_effects(self, super_weight: SuperWeight, 
-                                          model_name: str,
-                                          test_texts: Optional[List[str]] = None,
-                                          dataset_name: Optional[str] = None,
-                                          dataset_config: Optional[str] = None,
-                                          n_samples: int = 500,
-                                          max_length: int = 512,
-                                          save_plots: bool = True,
-                                          display_results: bool = True) -> str:
-        """
-        Analyze vocabulary effects and save results with plots.
-        
-        Args:
-            super_weight: SuperWeight to analyze
-            model_name: Name of the model for saving results
-            test_texts: Optional list of custom test texts (takes priority if provided)
-            dataset_name: Dataset name (e.g., 'wikitext')
-            dataset_config: Dataset config (e.g., 'wikitext-2-raw-v1') 
-            n_samples: Number of dataset samples to use
-            max_length: Maximum sequence length for dataset samples
-            save_plots: Whether to generate and save plots
-            display_results: Whether to display results to console
+        print(f"Evaluated on {intervention_results['n_samples']} samples")
+
+    def display_cascade_results(self, cascade_results: Dict[str, Any]) -> None:
+        """Display cascade analysis results in a readable format with actual layer indices"""
+        if 'error' in cascade_results:
+            print(f"=== Cascade Analysis Error ===")
+            print(f"Error: {cascade_results['error']}")
+            return
             
-        Returns:
-            Path to saved results file
-        """
+        sw = cascade_results['super_weight']
         
-        print(f"Analyzing vocabulary effects for {super_weight} in {model_name}...")
+        print(f"=== Cascade Effect Card: {sw} ===")
+        print(f"Input: {cascade_results['input_text']}")
+        print(f"Pattern: {cascade_results['amplification_pattern']}")
+        print(f"Layers analyzed: {cascade_results['num_layers_analyzed']}")
+        print(f"Actual layer indices: {cascade_results['actual_layer_indices']}")
+        print(f"Top-K margin parameter: {cascade_results['top_k_margin']}")
         
-        # Run the analysis
-        results = self.analyze_vocabulary_effects(
-            super_weight, test_texts, dataset_name, dataset_config, n_samples, max_length
-        )
+        print("\nLayer-by-layer effects:")
+        for layer_idx, effects in cascade_results['layer_effects'].items():
+            print(f"  Layer {layer_idx}: entropy_Δ={effects['entropy_change']:+.4f}, "
+                  f"margin_Δ={effects['margin_change']:+.4f}, "
+                  f"magnitude={effects['effect_magnitude']:.4f}")
         
-        # Display results if requested
-        if display_results:
-            self.display_analysis_results(results)
-        
-        # Save results
-        saved_path = self.results_manager.save_vocabulary_effects_analysis(
-            results, model_name, save_plots
-        )
-        
-        print(f"✅ Results saved to: {saved_path}")
-        if save_plots:
-            print(f"📊 Plots saved to: {self.results_manager.plots_dir}")
-        
-        return saved_path
-    
-    def analyze_and_save_neuron_vocabulary(self, super_weight: SuperWeight, 
-                                         model_name: str,
-                                         save_plots: bool = True,
-                                         display_results: bool = True) -> str:
-        """
-        Analyze neuron vocabulary effects and save results with plots.
-        
-        Args:
-            super_weight: SuperWeight to analyze (identifies the neuron)
-            model_name: Name of the model for saving results
-            save_plots: Whether to generate and save plots
-            display_results: Whether to display results to console
-            
-        Returns:
-            Path to saved results file
-        """
-        
-        print(f"Analyzing neuron vocabulary effects for {super_weight} in {model_name}...")
-        
-        # Run the analysis
-        results = self.analyze_neuron_vocabulary_effects(super_weight)
-        
-        # Display results if requested and no error
-        if display_results and 'error' not in results:
-            self.display_analysis_results(results)
-        elif 'error' in results:
-            print(f"❌ Analysis failed: {results['error']}")
-        
-        # Save results
-        saved_path = self.results_manager.save_neuron_vocabulary_analysis(
-            results, model_name, save_plots
-        )
-        
-        print(f"✅ Results saved to: {saved_path}")
-        if save_plots and 'error' not in results:
-            print(f"📊 Plots saved to: {self.results_manager.plots_dir}")
-        
-        return saved_path
-    
-    def analyze_and_save_cascade(self, super_weight: SuperWeight, 
-                               model_name: str,
-                               input_text: str = "Apple Inc. is a tech company.",
-                               method: str = "residual_stream",
-                               save_plots: bool = True,
-                               display_results: bool = True) -> str:
-        """
-        Analyze vocabulary cascade and save results with plots.
-        
-        Args:
-            super_weight: SuperWeight to analyze
-            model_name: Name of the model for saving results
-            input_text: Text to analyze
-            method: 'full_projection' or 'residual_stream'
-            save_plots: Whether to generate and save plots
-            display_results: Whether to display results to console
-            
-        Returns:
-            Path to saved results file
-        """
-        
-        print(f"Analyzing vocabulary cascade ({method}) for {super_weight} in {model_name}...")
-        
-        # Run the analysis
-        results = self.analyze_vocabulary_cascade(super_weight, input_text, method)
-        
-        # Display results if requested and no error
-        if display_results and 'error' not in results:
-            self.display_cascade_analysis(results)
-        elif 'error' in results:
-            print(f"❌ Analysis failed: {results['error']}")
-        
-        # Save results
-        saved_path = self.results_manager.save_cascade_analysis(
-            results, model_name, save_plots
-        )
-        
-        print(f"✅ Results saved to: {saved_path}")
-        if save_plots and 'error' not in results:
-            print(f"📊 Plots saved to: {self.results_manager.plots_dir}")
-        
-        return saved_path
-    
-    def analyze_and_save_neuron_vs_super_weight(self, super_weight: SuperWeight,
-                                              model_name: str,
-                                              test_texts: Optional[List[str]] = None,
-                                              dataset_name: Optional[str] = None,
-                                              dataset_config: Optional[str] = None,
-                                              n_samples: int = 500,
-                                              save_plots: bool = True,
-                                              display_results: bool = True) -> str:
-        """
-        Compare neuron vs super weight effects and save results with plots.
-        
-        Args:
-            super_weight: SuperWeight to analyze
-            model_name: Name of the model for saving results
-            test_texts: Optional custom test texts for super weight analysis
-            dataset_name: Dataset for super weight analysis (if test_texts is None)
-            dataset_config: Dataset config
-            n_samples: Number of samples for dataset analysis
-            save_plots: Whether to generate and save plots
-            display_results: Whether to display results to console
-            
-        Returns:
-            Path to saved results file
-        """
-        
-        print(f"Comparing neuron vs super weight for {super_weight} in {model_name}...")
-        
-        # Run the comparison
-        results = self.compare_neuron_vs_super_weight(
-            super_weight, test_texts, dataset_name, dataset_config, n_samples
-        )
-        
-        # Display results if requested and no error
-        if display_results and 'error' not in results:
-            self.display_neuron_vs_super_weight_comparison(results)
-        elif 'error' in results:
-            print(f"❌ Comparison failed: {results['error']}")
-        
-        # Save results
-        saved_path = self.results_manager.save_comparison_analysis(
-            results, model_name, 'neuron_vs_super_weight', save_plots
-        )
-        
-        print(f"✅ Results saved to: {saved_path}")
-        if save_plots and 'error' not in results:
-            print(f"📊 Plots saved to: {self.results_manager.plots_dir}")
-        
-        return saved_path
-    
-    def run_complete_vocabulary_analysis(self, super_weight: SuperWeight,
-                                       model_name: str,
-                                       test_texts: Optional[List[str]] = None,
-                                       dataset_name: Optional[str] = None,
-                                       dataset_config: Optional[str] = None,
-                                       n_samples: int = 500,
-                                       cascade_input: str = "Apple Inc. is a tech company.",
-                                       save_plots: bool = True,
-                                       display_results: bool = False) -> Dict[str, str]:
-        """
-        Run all vocabulary analyses for a super weight and save results.
-        
-        Args:
-            super_weight: SuperWeight to analyze
-            model_name: Name of the model for saving results
-            test_texts: Optional custom test texts
-            dataset_name: Dataset name for vocabulary effects analysis
-            dataset_config: Dataset config
-            n_samples: Number of samples for dataset analysis
-            cascade_input: Input text for cascade analysis
-            save_plots: Whether to generate and save plots
-            display_results: Whether to display results to console (usually False for batch runs)
-            
-        Returns:
-            Dictionary mapping analysis type to saved file path
-        """
-        
-        print(f"\n🔬 Running complete vocabulary analysis for {super_weight} in {model_name}")
-        print("=" * 80)
-        
-        saved_files = {}
-        
-        # 1. Vocabulary effects analysis
-        try:
-            saved_files['vocabulary_effects'] = self.analyze_and_save_vocabulary_effects(
-                super_weight, model_name, test_texts, dataset_name, dataset_config, 
-                n_samples, display_results=display_results, save_plots=save_plots
-            )
-        except Exception as e:
-            print(f"❌ Vocabulary effects analysis failed: {e}")
-            saved_files['vocabulary_effects'] = None
-        
-        # 2. Neuron vocabulary analysis
-        try:
-            saved_files['neuron_vocabulary'] = self.analyze_and_save_neuron_vocabulary(
-                super_weight, model_name, save_plots=save_plots, display_results=display_results
-            )
-        except Exception as e:
-            print(f"❌ Neuron vocabulary analysis failed: {e}")
-            saved_files['neuron_vocabulary'] = None
-        
-        # 3. Neuron vs super weight comparison
-        try:
-            saved_files['neuron_vs_super_weight'] = self.analyze_and_save_neuron_vs_super_weight(
-                super_weight, model_name, test_texts, dataset_name, dataset_config, 
-                n_samples, save_plots=save_plots, display_results=display_results
-            )
-        except Exception as e:
-            print(f"❌ Neuron vs super weight comparison failed: {e}")
-            saved_files['neuron_vs_super_weight'] = None
-        
-        # 4. Cascade analysis (residual stream)
-        try:
-            saved_files['cascade_residual'] = self.analyze_and_save_cascade(
-                super_weight, model_name, cascade_input, method="residual_stream",
-                save_plots=save_plots, display_results=display_results
-            )
-        except Exception as e:
-            print(f"❌ Cascade analysis (residual stream) failed: {e}")
-            saved_files['cascade_residual'] = None
-        
-        # 5. Cascade analysis (full projection) - optional, can be slow
-        try:
-            saved_files['cascade_full_projection'] = self.analyze_and_save_cascade(
-                super_weight, model_name, cascade_input, method="full_projection",
-                save_plots=save_plots, display_results=display_results
-            )
-        except Exception as e:
-            print(f"❌ Cascade analysis (full projection) failed: {e}")
-            saved_files['cascade_full_projection'] = None
-        
-        print(f"\n✅ Complete vocabulary analysis finished for {super_weight}")
-        success_count = sum(1 for path in saved_files.values() if path is not None)
-        print(f"📊 Successfully saved {success_count}/{len(saved_files)} analyses")
-        print("=" * 80)
-        
-        return saved_files
-    
-    def create_model_summary_report(self, model_name: str) -> str:
-        """
-        Create a summary report of all vocabulary analyses for a model.
-        
-        Args:
-            model_name: Name of the model to summarize
-            
-        Returns:
-            Path to the saved summary report
-        """
-        return self.results_manager.create_summary_report(model_name)
+        # Show progression pattern
+        entropies = [effects['entropy_change'] for effects in cascade_results['layer_effects'].values()]
+        if len(entropies) > 1:
+            print(f"\nEntropy change progression: {entropies[0]:+.4f} → {entropies[-1]:+.4f} "
+                  f"(amplification: {abs(entropies[-1]/entropies[0]):.2f}x)" if entropies[0] != 0 else "")
