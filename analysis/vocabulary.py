@@ -790,8 +790,12 @@ class VocabularyAnalyzer:
         components = self.mlp_handler.get_mlp_components(super_weight.layer)
         down_proj = components['down']
         
-        # Find coordinate with similar magnitude
-        target_magnitude = abs(super_weight.original_value)
+        # Find coordinate with similar magnitude using original_value
+        if super_weight.original_value is not None:
+            target_magnitude = abs(float(super_weight.original_value))
+        else:
+            # Fallback: use magnitude_product 
+            target_magnitude = super_weight.magnitude_product
         weight_matrix = down_proj.weight.abs()
         
         # Find all weights within 10% of target magnitude
