@@ -9,7 +9,6 @@ from detection.super_weight import SuperWeight
 from utils.model_architectures import UniversalMLPHandler
 from .vocabulary import VocabularyAnalyzer
 from .metrics import MetricsAnalyzer
-from .patterns import PatternsAnalyzer
 from .activation import SuperActivationAnalyzer
 
 
@@ -28,7 +27,6 @@ class SuperWeightAnalyzer:
         # Initialize specialized analyzers with the shared handler
         self.vocabulary_analyzer = VocabularyAnalyzer(model, tokenizer, manager, mlp_handler)
         self.metrics_analyzer = MetricsAnalyzer(model, tokenizer, manager, mlp_handler)
-        self.patterns_analyzer = PatternsAnalyzer(model, tokenizer, manager, mlp_handler)
         self.super_activation_analyzer = SuperActivationAnalyzer(model, tokenizer, mlp_handler, log_level)  # Pass handler
         
         # Setup logging

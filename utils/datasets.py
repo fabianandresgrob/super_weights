@@ -190,6 +190,50 @@ class DatasetLoader:
         
         return examples
     
+    def load_gsm8k(self, split: str = 'test', n_samples: int = 100) -> List[Dict[str, Any]]:
+        """
+        Load GSM8K dataset for mathematical reasoning.
+        
+        Args:
+            split: Dataset split
+            n_samples: Number of samples to load
+            
+        Returns:
+            List of GSM8K examples
+        """
+        
+        import re
+        
+        dataset = load_dataset('gsm8k', 'main', split=split, streaming=True)
+        examples = []
+        
+        for i, example in enumerate(dataset):
+            if i >= n_samples:
+                break
+            
+            # Extract numerical answer from the solution
+            answer_text = example['answer']
+            # Find the final numerical answer (typically after #### in GSM8K)
+            if '####' in answer_text:
+                answer_str = answer_text.split('####')[-1].strip()
+            else:
+                # Try to extract the last number in the answer
+                numbers = re.findall(r'-?\d+(?:\.\d+)?', answer_text)
+                answer_str = numbers[-1] if numbers else "0"
+            
+            try:
+                answer_num = float(answer_str.replace(',', ''))
+            except:
+                answer_num = 0.0
+            
+            examples.append({
+                'question': example['question'],
+                'answer': answer_num,
+                'answer_text': answer_text
+            })
+        
+        return examples
+    
     def load_custom_text_samples(self, 
                                 domain: str = 'general',
                                 n_samples: int = 50) -> List[str]:
@@ -326,93 +370,11 @@ class DatasetLoader:
             'perplexity_texts': self.load_perplexity_dataset(n_samples=50),
             'hellaswag': self.load_hellaswag(n_samples=50),
             'arc_easy': self.load_arc(difficulty='easy', n_samples=50),
+            'mmlu': self.load_mmlu(n_samples=50),
+            'gsm8k': self.load_gsm8k(n_samples=50),
             'general_texts': self.load_custom_text_samples('general', 25),
             'code_texts': self.load_custom_text_samples('code', 25),
             'math_texts': self.load_custom_text_samples('math', 25),
             'scientific_texts': self.load_custom_text_samples('scientific', 25),
             'conversational_texts': self.load_custom_text_samples('conversational', 25)
         }
-    
-    def create_multilingual_test_set(self, languages: List[str] = None) -> Dict[str, List[str]]:
-        """
-        Create a test set with simple sentences in multiple languages.
-        
-        Args:
-            languages: List of language codes
-            
-        Returns:
-            Dictionary mapping language codes to text samples
-        """
-        
-        if languages is None:
-            languages = ['en', 'es', 'fr', 'de', 'zh', 'ja', 'ar', 'hi']
-        
-        # Simple test sentences (these would ideally be loaded from proper multilingual datasets)
-        base_sentences = {
-            'en': [
-                "The quick brown fox jumps over the lazy dog.",
-                "Machine learning is transforming technology.",
-                "The weather is beautiful today.",
-                "I enjoy reading books in my free time.",
-                "Science and technology advance rapidly."
-            ],
-            'es': [
-                "El rápido zorro marrón salta sobre el perro perezoso.",
-                "El aprendizaje automático está transformando la tecnología.",
-                "El clima está hermoso hoy.",
-                "Disfruto leyendo libros en mi tiempo libre.",
-                "La ciencia y la tecnología avanzan rápidamente."
-            ],
-            'fr': [
-                "Le renard brun rapide saute par-dessus le chien paresseux.",
-                "L'apprentissage automatique transforme la technologie.",
-                "Le temps est magnifique aujourd'hui.",
-                "J'aime lire des livres pendant mon temps libre.",
-                "La science et la technologie progressent rapidement."
-            ],
-            'de': [
-                "Der schnelle braune Fuchs springt über den faulen Hund.",
-                "Maschinelles Lernen verändert die Technologie.",
-                "Das Wetter ist heute schön.",
-                "Ich lese gerne Bücher in meiner Freizeit.",
-                "Wissenschaft und Technologie entwickeln sich schnell."
-            ],
-            'zh': [
-                "快速的棕色狐狸跳过懒狗。",
-                "机器学习正在改变技术。",
-                "今天天气很好。",
-                "我喜欢在空闲时间读书。",
-                "科学技术发展迅速。"
-            ],
-            'ja': [
-                "素早い茶色のキツネが怠惰な犬を飛び越える。",
-                "機械学習が技術を変革している。",
-                "今日は天気が美しい。",
-                "自由時間に本を読むのが好きです。",
-                "科学技術は急速に進歩している。"
-            ],
-            'ar': [
-                "الثعلب البني السريع يقفز فوق الكلب الكسول.",
-                "التعلم الآلي يغير التكنولوجيا.",
-                "الطقس جميل اليوم.",
-                "أستمتع بقراءة الكتب في وقت فراغي.",
-                "العلم والتكنولوجيا يتقدمان بسرعة."
-            ],
-            'hi': [
-                "तेज़ भूरी लोमड़ी आलसी कुत्ते के ऊपर से कूदती है।",
-                "मशीन लर्निंग तकनीक को बदल रही है।",
-                "आज मौसम सुंदर है।",
-                "मुझे अपने खाली समय में किताबें पढ़ना पसंद है।",
-                "विज्ञान और तकनीक तेजी से आगे बढ़ रहे हैं।"
-            ]
-        }
-        
-        multilingual_set = {}
-        for lang in languages:
-            if lang in base_sentences:
-                multilingual_set[lang] = base_sentences[lang]
-            else:
-                # Fallback to English if language not available
-                multilingual_set[lang] = base_sentences['en']
-        
-        return multilingual_set

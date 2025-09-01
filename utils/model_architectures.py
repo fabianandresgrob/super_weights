@@ -19,6 +19,7 @@ class MLPArchitectureType(Enum):
     MOE_GATED = "moe_gated"
     MOE_STANDARD = "moe_standard"
     MOE_WITH_SHARED_EXPERT = "moe_with_shared_expert"
+    HYBRID_MOE = "hybrid_moe"  # For Deepseek-style hybrid architectures
     UNKNOWN = "unknown"
 
 
@@ -54,6 +55,9 @@ class MoEArchitectureInfo:
     routing_info: MoERoutingInfo
     has_shared_expert: bool = False
     shared_expert_module: Optional[nn.Module] = None
+    # Support for hybrid architectures
+    is_hybrid: bool = False
+    hybrid_start_layer: Optional[int] = None  # First layer that is MoE
 
 
 @dataclass 
@@ -130,6 +134,10 @@ class ModelArchitectureRegistry:
     MOE_PATH_PATTERNS = ["block_sparse_moe", "moe"]
     MOE_EXPERT_PATTERNS = ["experts"]
     MOE_ROUTER_PATTERNS = ["gate", "router"]
+
+    # Support for hybrid architectures
+    is_hybrid: bool = False
+    hybrid_start_layer: Optional[int] = None  # First layer that is MoE
     
     ATTENTION_COMPONENT_PATTERNS = {
         'q_proj': ['q_proj', 'query', 'c_attn'],
@@ -197,6 +205,59 @@ class ModelArchitectureRegistry:
     def _is_moe_block(cls, module: nn.Module) -> bool:
         """Check if a module is actually an MoE block"""
         return hasattr(module, 'experts') and hasattr(module, 'gate')
+    
+    @classmethod
+    def is_deepseek_model(cls, model: nn.Module) -> bool:
+        """Check if this is a Deepseek model"""
+        model_class = model.__class__.__name__
+        config = getattr(model, 'config', None)
+        model_type = getattr(config, 'model_type', '').lower() if config else ''
+        
+        return ('deepseek' in model_class.lower() or 
+                'deepseek' in model_type or
+                any(hasattr(layer, 'mlp') and 'Deepseek' in layer.mlp.__class__.__name__ 
+                    for layer in getattr(model, 'layers', [])[:5]))  # Check first 5 layers
+
+    @classmethod
+    def detect_hybrid_moe_pattern(cls, model: nn.Module) -> Optional[Dict[str, Any]]:
+        """Detect hybrid MoE pattern (like Deepseek)"""
+        if not cls.is_deepseek_model(model):
+            return None
+            
+        layers = cls.find_layers(model)
+        if not layers:
+            return None
+        
+        # Analyze first few layers to detect hybrid pattern
+        layer_types = []
+        for i, layer in enumerate(layers[:min(5, len(layers))]):
+            mlp_module = cls.find_mlp(layer)
+            moe_module = cls.find_moe_module(layer)
+            
+            if moe_module:
+                layer_types.append('moe')
+            elif mlp_module:
+                layer_types.append('mlp')
+            else:
+                layer_types.append('unknown')
+        
+        # Check for hybrid pattern: starts with MLP, then switches to MoE
+        if len(layer_types) >= 2 and layer_types[0] == 'mlp':
+            # Find where MoE starts
+            moe_start = None
+            for i, layer_type in enumerate(layer_types[1:], 1):
+                if layer_type == 'moe':
+                    moe_start = i
+                    break
+            
+            if moe_start is not None:
+                return {
+                    'is_hybrid': True,
+                    'moe_start_layer': moe_start,
+                    'pattern': layer_types
+                }
+        
+        return None
 
     @classmethod
     def find_mlp(cls, layer: nn.Module) -> Optional[nn.Module]:
@@ -551,8 +612,18 @@ class UniversalLayerHandler:
         first_expert = experts[0]
         expert_arch = self._detect_mlp_architecture(first_expert)
         
+        # Check for shared experts - handle both singular and plural naming
+        has_shared_expert = (hasattr(moe_module, 'shared_expert') or 
+                           hasattr(moe_module, 'shared_experts'))
+        shared_expert_module = None
+        
+        if hasattr(moe_module, 'shared_experts'):  # Deepseek style
+            shared_expert_module = getattr(moe_module, 'shared_experts')
+        elif hasattr(moe_module, 'shared_expert'):  # Other models
+            shared_expert_module = getattr(moe_module, 'shared_expert')
+        
         if expert_arch.architecture_type == MLPArchitectureType.GATED_MLP:
-            if hasattr(moe_module, 'shared_expert'):
+            if has_shared_expert:
                 moe_type = MLPArchitectureType.MOE_WITH_SHARED_EXPERT
             else:
                 moe_type = MLPArchitectureType.MOE_GATED
@@ -564,8 +635,8 @@ class UniversalLayerHandler:
         moe_info = MoEArchitectureInfo(
             num_experts=len(experts),
             routing_info=routing_info,
-            has_shared_expert=hasattr(moe_module, 'shared_expert'),
-            shared_expert_module=getattr(moe_module, 'shared_expert', None)
+            has_shared_expert=has_shared_expert,
+            shared_expert_module=shared_expert_module
         )
         
         return MLPArchitectureInfo(
@@ -871,6 +942,24 @@ class UniversalMLPHandler(UniversalLayerHandler):
     def __init__(self, model: nn.Module):
         super().__init__(model)
         self.logger = logging.getLogger(f"UniversalMLPHandler_{id(self)}")
+
+        self.hybrid_info = self.registry.detect_hybrid_moe_pattern(model)
+        if self.hybrid_info:
+            self.logger.info(f"Detected hybrid MoE architecture: MoE starts at layer {self.hybrid_info['moe_start_layer']}")
+
+    def is_moe_layer(self, layer_idx: int) -> bool:
+        """Check if a specific layer is MoE - enhanced for hybrid architectures"""
+        # Handle hybrid architectures
+        if self.hybrid_info and self.hybrid_info['is_hybrid']:
+            if layer_idx < self.hybrid_info['moe_start_layer']:
+                return False  # Pre-MoE layers are regular MLPs
+            # Fall through to normal detection for MoE layers
+        
+        return self.get_mlp_architecture(layer_idx).is_moe
+    
+    def get_hybrid_info(self) -> Optional[Dict[str, Any]]:
+        """Get hybrid architecture information"""
+        return self.hybrid_info
     
     def extract_weights(self, layer_idx: int) -> Dict[str, torch.Tensor]:
         """Extract MLP weight tensors for a layer"""
@@ -928,6 +1017,29 @@ class UniversalMLPHandler(UniversalLayerHandler):
         components = {}
         for comp_type, comp_info in expert_arch.components.items():
             components[comp_type] = getattr(expert, comp_info.component_name)
+        
+        return components
+    
+    def get_shared_expert_module(self, layer_idx: int) -> Optional[nn.Module]:
+        """Get the shared expert module for an MoE layer (if it exists)"""
+        mlp_info = self.get_mlp_architecture(layer_idx)
+        if not mlp_info.is_moe or not mlp_info.moe_info or not mlp_info.moe_info.has_shared_expert:
+            return None
+        
+        return mlp_info.moe_info.shared_expert_module
+    
+    def get_shared_expert_components(self, layer_idx: int) -> Dict[str, nn.Module]:
+        """Get components of the shared expert in an MoE layer (if it exists)"""
+        shared_expert_module = self.get_shared_expert_module(layer_idx)
+        if shared_expert_module is None:
+            raise ValueError(f"Layer {layer_idx} has no shared expert")
+        
+        # Detect components for the shared expert (same as regular MLP)
+        shared_expert_arch = self._detect_mlp_architecture(shared_expert_module)
+        
+        components = {}
+        for comp_type, comp_info in shared_expert_arch.components.items():
+            components[comp_type] = getattr(shared_expert_module, comp_info.component_name)
         
         return components
     

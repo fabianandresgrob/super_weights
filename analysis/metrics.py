@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import re
 from typing import List, Dict, Any, Optional
 from datasets import load_dataset
 
@@ -52,7 +53,7 @@ class MetricsAnalyzer:
             is_multiple = False
         
         # Load dataset
-        dataset = load_dataset(dataset_name, dataset_config, split=split, streaming=True)
+        dataset = load_dataset(dataset_name, dataset_config, split=split, streaming=False)
         dataset = dataset.shuffle(seed=42)  # Shuffle for randomness
         texts = []
         
@@ -231,7 +232,7 @@ class MetricsAnalyzer:
         """Load data for a specific task"""
         try:
             if task == 'hellaswag':
-                dataset = load_dataset('hellaswag', split='validation', streaming=True)
+                dataset = load_dataset('hellaswag', split='validation', streaming=False)
                 dataset = dataset.shuffle(seed=42)  # Shuffle for randomness
                 data = []
                 for i, example in enumerate(dataset):
@@ -245,7 +246,7 @@ class MetricsAnalyzer:
                 return data
             
             elif task == 'arc_easy':
-                dataset = load_dataset('ai2_arc', 'ARC-Easy', split='test', streaming=True)
+                dataset = load_dataset('ai2_arc', 'ARC-Easy', split='test', streaming=False)
                 data = []
                 for i, example in enumerate(dataset):
                     if i >= n_samples:
@@ -258,7 +259,7 @@ class MetricsAnalyzer:
                 return data
             
             elif task == 'arc_challenge':
-                dataset = load_dataset('ai2_arc', 'ARC-Challenge', split='test', streaming=True)
+                dataset = load_dataset('ai2_arc', 'ARC-Challenge', split='test', streaming=False)
                 data = []
                 for i, example in enumerate(dataset):
                     if i >= n_samples:
@@ -267,6 +268,57 @@ class MetricsAnalyzer:
                         'question': example['question'],
                         'choices': example['choices']['text'],
                         'label': example['choices']['label'].index(example['answerKey'])
+                    })
+                return data
+            
+            elif task == 'mmlu':
+                # Load multiple MMLU subjects
+                subjects = ['abstract_algebra', 'anatomy', 'business_ethics']
+                all_data = []
+                samples_per_subject = max(1, n_samples // len(subjects))
+                
+                for subject in subjects:
+                    dataset = load_dataset('cais/mmlu', subject, split='test', streaming=False)
+                    subject_data = []
+                    for i, example in enumerate(dataset):
+                        if i >= samples_per_subject:
+                            break
+                        subject_data.append({
+                            'question': example['question'],
+                            'choices': [example['A'], example['B'], example['C'], example['D']],
+                            'label': example['answer'],  # 0, 1, 2, or 3
+                            'subject': subject
+                        })
+                    all_data.extend(subject_data)
+                
+                return all_data[:n_samples]
+            
+            elif task == 'gsm8k':
+                dataset = load_dataset('gsm8k', 'main', split='test', streaming=False)
+                data = []
+                for i, example in enumerate(dataset):
+                    if i >= n_samples:
+                        break
+                    
+                    # Extract numerical answer from the solution
+                    answer_text = example['answer']
+                    # Find the final numerical answer (typically after #### in GSM8K)
+                    if '####' in answer_text:
+                        answer_str = answer_text.split('####')[-1].strip()
+                    else:
+                        # Try to extract the last number in the answer
+                        numbers = re.findall(r'-?\d+(?:\.\d+)?', answer_text)
+                        answer_str = numbers[-1] if numbers else "0"
+                    
+                    try:
+                        answer_num = float(answer_str.replace(',', ''))
+                    except:
+                        answer_num = 0.0
+                    
+                    data.append({
+                        'question': example['question'],
+                        'answer': answer_num,
+                        'answer_text': answer_text
                     })
                 return data
             
@@ -288,11 +340,20 @@ class MetricsAnalyzer:
                     prediction = self._predict_hellaswag(example)
                 elif task in ['arc_easy', 'arc_challenge']:
                     prediction = self._predict_arc(example)
+                elif task == 'mmlu':
+                    prediction = self._predict_mmlu(example)
+                elif task == 'gsm8k':
+                    prediction = self._predict_gsm8k(example)
                 else:
                     continue
                 
-                if prediction == example['label']:
-                    correct += 1
+                if task == 'gsm8k':
+                    # For GSM8K, check if the predicted answer is close to the correct one
+                    if abs(prediction - example['answer']) < 0.01:
+                        correct += 1
+                else:
+                    if prediction == example['label']:
+                        correct += 1
                 total += 1
                 
             except Exception as e:
@@ -352,6 +413,65 @@ class MetricsAnalyzer:
                     best_idx = i
         
         return best_idx
+    
+    def _predict_mmlu(self, example: Dict) -> int:
+        """Predict MMLU answer"""
+        question = example['question']
+        choices = example['choices']
+        
+        best_score = float('-inf')
+        best_idx = 0
+        
+        for i, choice in enumerate(choices):
+            # Create question-answer format
+            qa_text = f"Question: {question}\n\nChoices:\nA. {choices[0]}\nB. {choices[1]}\nC. {choices[2]}\nD. {choices[3]}\n\nAnswer: {choice}"
+            
+            # Tokenize
+            tokens = self.tokenizer(qa_text, return_tensors='pt', truncation=True, max_length=512).to(self.model.device)
+            
+            # Compute log probability
+            with torch.no_grad():
+                outputs = self.model(**tokens, labels=tokens['input_ids'])
+                log_prob = -outputs.loss.item()
+                
+                if log_prob > best_score:
+                    best_score = log_prob
+                    best_idx = i
+        
+        return best_idx
+    
+    def _predict_gsm8k(self, example: Dict) -> float:
+        """Predict GSM8K numerical answer"""
+        question = example['question']
+        
+        # Create a prompt for numerical reasoning
+        prompt = f"Question: {question}\nLet's think step by step.\nAnswer:"
+        
+        # Tokenize
+        tokens = self.tokenizer(prompt, return_tensors='pt', truncation=True, max_length=512).to(self.model.device)
+        
+        # Generate answer
+        with torch.no_grad():
+            output = self.model.generate(
+                tokens['input_ids'],
+                max_new_tokens=100,
+                do_sample=False,
+                temperature=0.0,
+                pad_token_id=self.tokenizer.eos_token_id
+            )
+        
+        # Decode the generated text
+        generated_text = self.tokenizer.decode(output[0][tokens['input_ids'].shape[1]:], skip_special_tokens=True)
+        
+        # Extract numerical answer
+        numbers = re.findall(r'-?\d+(?:\.\d+)?', generated_text)
+        if numbers:
+            try:
+                return float(numbers[-1].replace(',', ''))
+            except:
+                return 0.0
+        else:
+            return 0.0
     
     def _classify_accuracy_impact(self, accuracy_drop: float) -> str:
         """Classify the severity of accuracy impact"""

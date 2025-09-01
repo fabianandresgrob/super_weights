@@ -1,10 +1,16 @@
-# Super Weight Attack Evaluation Script
+# Super Weight Attack Module
 
-This script provides a comprehensive evaluation framework for running adversarial attacks on super weights in large language models.
+This module provides adversarial attacks on super weights in large language models. The main script `run_large_model_attack_evaluation.py` provides a comprehensive evaluation framework.
+
+## Module Components
+
+- **`attack.py`**: Core attack implementation with 5 hypothesis classes (A, B, C, D, E) and the SuperWeightAttacker class
+- **`run_large_model_attack_evaluation.py`**: Comprehensive evaluation script for running attacks across multiple models
+- **`attack_eval.py`**: Evaluation utilities for consistency testing and perplexity bake-off
 
 ## Overview
 
-The script:
+The main evaluation script `run_large_model_attack_evaluation.py`:
 1. **Detects super weights** in the specified models
 2. **Runs attacks** for all super weights (except last layer) with Hypothesis D (primary) and A (secondary)  
 3. **Validates attack consistency** using multi-seed evaluation
@@ -22,26 +28,16 @@ The script:
 # Quick test with a small model
 python attack/run_large_model_attack_evaluation.py \
   --models "allenai/OLMo-1B-0724-hf" \
-  --output_dir ./results \
-  --use_fp16 --device_map_auto
+  --output_dir ./results
 
-# Multiple larger models (optimized for 2x GPU with ~42GB VRAM)
+# Multiple larger models
 python attack/run_large_model_attack_evaluation.py \
   --models "mistralai/Mistral-7B-v0.1" "microsoft/Phi-3-mini-4k-instruct" \
   --output_dir ./results_large \
-  --use_fp16 --device_map_auto \
   --attack_batch_size 128 --bakeoff_batch_size 8
 ```
 
 ## GPU Setup Recommendations
-
-For your **2x NVIDIA GPU setup with ~42GB total VRAM**:
-
-### Essential Flags
-- `--use_fp16`: Use float16 precision (essential for 7B+ models)
-- `--device_map_auto`: Automatically distribute model across GPUs
-- `--attack_batch_size 64-128`: Reduce if you get OOM errors
-- `--bakeoff_batch_size 4-8`: Very small batches for perplexity evaluation
 
 ### Memory Management
 ```bash
@@ -64,8 +60,7 @@ python attack/run_large_model_attack_evaluation.py --attack_batch_size 64 --bake
 - `--cache_dir DIR`: Directory to cache models (default: ~/models/)
 
 ### Model Loading
-- `--device_map_auto`: Use automatic device mapping for multi-GPU (recommended)
-- `--use_fp16`: Use float16 precision to save VRAM (recommended for large models)
+- `--cache_dir DIR`: Directory to cache models (default: ~/models/)
 
 ### Super Weight Detection
 - `--spike_threshold FLOAT`: Threshold for super weight detection (default: 50.0)
@@ -79,32 +74,41 @@ python attack/run_large_model_attack_evaluation.py --attack_batch_size 64 --bake
 - `--head_reduction {single,mean,weighted,topk}`: Head reduction for Hypothesis D (default: mean)
 - `--attack_num_steps INT`: Attack optimization steps (default: 200)
 - `--attack_batch_size INT`: Attack batch size (default: 256)
+- `--attack_search_width INT`: Attack search width (default: 512)
+- `--attack_top_k INT`: Top-k for attack search (default: 256)
 - `--placement {prefix,suffix}`: Adversarial string placement (default: prefix)
-- `--adv_string_init STR`: Initial adversarial string (default: "! ! ! ! ! ! ! ! ! !")
+- `--adv_string_init STR`: Initial adversarial string (default: "<bos> ~ <bos> ~ <bos>")
+- `--allow_non_ascii`: Allow non-ASCII characters in adversarial strings (default: True)
+- `--attack_prompt STR`: Custom prompt for attacks (default: random WikiText-2)
 
 ### Evaluation Configuration
 - `--skip_consistency`: Skip consistency validation to save time
 - `--consistency_n_prompts INT`: Prompts for consistency evaluation (default: 100)
+- `--consistency_min_tokens INT`: Minimum tokens for consistency evaluation prompts (default: 6)
+- `--consistency_max_tokens INT`: Maximum tokens for consistency evaluation prompts (default: 40)
 - `--skip_bakeoff`: Skip perplexity bake-off to save time
 - `--bakeoff_n_prompts INT`: Prompts for perplexity evaluation (default: 100)
 - `--bakeoff_batch_size INT`: Batch size for perplexity evaluation (default: 16)
+- `--bakeoff_min_tokens INT`: Minimum tokens for bakeoff evaluation prompts (default: 50)
+- `--bakeoff_max_tokens INT`: Maximum tokens for bakeoff evaluation prompts (default: 150)
+- `--verbose`: Enable verbose logging
 
 ## Output Files
 
 The script generates several output files:
 
 ### JSON Results
-- `attack_evaluation_results_{model}_{timestamp}.json`: Complete results per model
+- `{model_name}/data/attack_evaluation_results_{timestamp}.json`: Complete results per model
 - `combined_attack_evaluation_results_{timestamp}.json`: Combined results for all models
 
 ### CSV Summary  
-- `attack_evaluation_summary_{model}_{timestamp}.csv`: Tabular summary with key metrics
+- `{model_name}/data/attack_evaluation_summary_{timestamp}.csv`: Tabular summary with key metrics
 
 ### Plots
-- `plots/perplexity_bakeoff_{layer}_{row}_{col}_{hypothesis}.png`: Perplexity bake-off plots
+- `{model_name}/plots/perplexity_bakeoff_{layer}_{row}_{col}_{hypothesis}.png`: Perplexity bake-off plots
 
 ### Logs
-- `attack_evaluation_{model}_{timestamp}.log`: Detailed execution logs
+- `{model_name}/logs/attack_evaluation_{timestamp}.log`: Detailed execution logs
 
 ## Key Metrics Saved
 
@@ -136,11 +140,10 @@ python attack/run_large_model_attack_evaluation.py \
   --attack_num_steps 100 \
   --consistency_n_prompts 50 \
   --bakeoff_n_prompts 50 \
-  --max_super_weights 2 \
-  --use_fp16 --device_map_auto
+  --max_super_weights 2
 ```
 
-### Production Run (2x GPU, 42GB VRAM)
+### Production Run (Large Models)
 ```bash
 python attack/run_large_model_attack_evaluation.py \
   --models "mistralai/Mistral-7B-v0.1" "meta-llama/Llama-3.1-8B" \
@@ -149,7 +152,6 @@ python attack/run_large_model_attack_evaluation.py \
   --attack_batch_size 64 \
   --bakeoff_batch_size 4 \
   --hypotheses D A \
-  --use_fp16 --device_map_auto \
   --output_dir ./production_results
 ```
 
@@ -162,36 +164,5 @@ python attack/run_large_model_attack_evaluation.py \
   --bakeoff_batch_size 2 \
   --max_super_weights 3 \
   --hypotheses D \
-  --skip_consistency \
-  --use_fp16 --device_map_auto
+  --skip_consistency
 ```
-
-## Troubleshooting
-
-### Out of Memory (OOM) Errors
-1. Reduce `--attack_batch_size` (try 64, 32, 16)
-2. Reduce `--bakeoff_batch_size` (try 4, 2, 1)
-3. Add `--max_super_weights N` to limit processing
-4. Use `--skip_consistency` or `--skip_bakeoff` to save memory
-
-### Slow Execution
-1. Reduce `--attack_num_steps` (try 150, 100)
-2. Reduce `--consistency_n_prompts` and `--bakeoff_n_prompts` (try 75, 50)
-3. Use `--max_super_weights` to limit scope
-4. Add `--skip_consistency` for faster runs
-
-### Model Loading Issues
-1. Check model name spelling and availability on HuggingFace
-2. Ensure sufficient disk space in `--cache_dir`
-3. Try without `--device_map_auto` if encountering device mapping issues
-
-## Performance Notes
-
-- **7B models**: Expect 2-4 hours per model with full evaluation
-- **1B models**: Expect 30-60 minutes per model with full evaluation  
-- **Memory usage**: Peak ~35-40GB for 7B models with our recommended settings
-- **Disk space**: ~20-50GB per model for caching, plus results storage
-
-## Advanced Usage
-
-See `attack/example_attack_evaluation.py` for more detailed examples and configurations.

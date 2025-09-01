@@ -71,6 +71,9 @@ class MoESuperWeight(SuperWeight):
     detection_iteration: Optional[int] = None  # Which iteration this was found
     position_indices: Optional[List[int]] = None  # Token positions that contributed to detection
     
+    # for shared experts
+    is_shared_expert: bool = False  # Flag for shared experts
+    
     @property
     def causal_agreement(self) -> Optional[float]:
         """Agreement between natural and interventional impact scores"""
