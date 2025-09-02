@@ -163,47 +163,59 @@ class SuperWeightManager:
 
         # MoE-aware path
         if self.mlp_handler.is_moe_layer(layer_idx):
-            if hasattr(super_weight, 'expert_id'):
-                expert_idx = super_weight.expert_id
-                component_path = super_weight.component
-
-                # Shared expert case
-                if getattr(super_weight, 'is_shared_expert', False):
-                    shared_components = self.mlp_handler.get_shared_expert_components(layer_idx)
-                    for comp_type, module in shared_components.items():
-                        if comp_type in ['down', 'output']:
-                            return module
-                    raise ValueError(f"No shared expert output projection found in layer {layer_idx}")
-
-                # Parse component path like 'experts.0.down_proj'
-                parts = component_path.split('.') if component_path else []
-                if len(parts) >= 3 and parts[0] == 'experts':
-                    component_name = parts[2]  # e.g., 'down_proj'
-                    expert_components = self.mlp_handler.get_expert_components(layer_idx, expert_idx)
-
-                    # Try to match by name using architecture hints
-                    arch_info = self.mlp_handler.get_mlp_architecture(layer_idx)
-                    if arch_info.is_moe and arch_info.moe_info and len(self.mlp_handler.get_moe_experts(layer_idx)) > expert_idx:
-                        first_expert = self.mlp_handler.get_moe_experts(layer_idx)[0]
-                        expert_arch = self.mlp_handler._detect_mlp_architecture(first_expert)
-                        for comp_type, module in expert_components.items():
-                            if comp_type in expert_arch.components:
-                                comp_info = expert_arch.components[comp_type]
-                                if comp_info.component_name == component_name:
-                                    return module
-                    raise ValueError(f"Component {component_name} not found in expert {expert_idx}")
-                else:
-                    raise ValueError(f"Invalid MoE component path: {component_path}")
-            else:
+            if not hasattr(super_weight, 'expert_id'):
                 raise ValueError(f"MoE super weight missing expert_id: {super_weight}")
+            
+            expert_idx = super_weight.expert_id
+            
+            # Handle shared expert case
+            if getattr(super_weight, 'is_shared_expert', False):
+                shared_components = self.mlp_handler.get_shared_expert_components(layer_idx)
+                for comp_type, module in shared_components.items():
+                    if comp_type in ['down', 'output']:
+                        return module
+                raise ValueError(f"No shared expert output projection found in layer {layer_idx}")
+            
+            # Get the expert module directly from MLP handler
+            expert_module = self.mlp_handler.get_expert_module(layer_idx, expert_idx)
+            if expert_module is None:
+                raise ValueError(f"Expert {expert_idx} not found in layer {layer_idx}")
+            
+            # Parse component path to get the specific weight module within the expert
+            component_path = super_weight.component
+            if not component_path:
+                raise ValueError(f"Component path missing for MoE super weight: {super_weight}")
+            
+            # Extract the weight component name from the path
+            # Expected format: "model.layers.X.mlp.experts.Y.weight_name"
+            parts = component_path.split('.')
+            if len(parts) < 2:
+                raise ValueError(f"Invalid component path format: {component_path}")
+            
+            weight_name = parts[-1]  # Last part should be the weight name (e.g., "weight")
+            component_name = parts[-2] if len(parts) >= 2 else weight_name  # Second to last should be component (e.g., "down_proj")
+            
+            # Get the weight module from the expert
+            if hasattr(expert_module, component_name):
+                return getattr(expert_module, component_name)
+            else:
+                # Fallback: try to match component using MLP handler
+                expert_components = self.mlp_handler.get_expert_components(layer_idx, expert_idx)
+                for comp_type, module in expert_components.items():
+                    if component_name in module.__class__.__name__.lower() or component_name in str(module):
+                        return module
+                raise ValueError(f"Component {component_name} not found in expert {expert_idx} of layer {layer_idx}")
+        
         else:
-            # Regular MLP layer
+            # Regular MLP layer - use MLP handler
             components = self.mlp_handler.get_mlp_components(layer_idx)
+            # Prefer 'down' component, fallback to 'output'
             if 'down' in components:
                 return components['down']
-            if 'output' in components:
+            elif 'output' in components:
                 return components['output']
-            raise ValueError(f"No output projection found in layer {layer_idx}")
+            else:
+                raise ValueError(f"No output projection found in layer {layer_idx}")
 
     # Public operations
     def scale_super_weights(self, super_weights: List[SuperWeight], scale_factor: float) -> bool:

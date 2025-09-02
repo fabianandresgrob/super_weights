@@ -84,6 +84,7 @@ class SuperWeightResearchSession:
                 model=self.model,
                 tokenizer=self.tokenizer,
                 mlp_handler=self.mlp_handler,
+                manager=self.manager,
                 architecture_type=self.model_info['architecture'],
                 log_level=log_level
             )

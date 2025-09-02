@@ -75,6 +75,11 @@ class MoESuperWeight(SuperWeight):
     is_shared_expert: bool = False  # Flag for shared experts
     
     @property
+    def moe_weight_key(self) -> Tuple[int, int, int, Optional[int]]:
+        """Unique key for MoE super weight including expert_id"""
+        return (self.layer, self.row, self.column, self.expert_id)
+    
+    @property
     def causal_agreement(self) -> Optional[float]:
         """Agreement between natural and interventional impact scores"""
         if self.impact_natural is not None and self.impact_interventional is not None:
@@ -89,6 +94,16 @@ class MoESuperWeight(SuperWeight):
         if self.routing_entropy is not None:
             return 1.0 / (1.0 + self.routing_entropy)
         return None
+    
+    def __hash__(self) -> int:
+        """Hash based on layer, row, column, and expert_id for unique identification"""
+        return hash(self.moe_weight_key)
+    
+    def __eq__(self, other) -> bool:
+        """Equality based on MoE weight key"""
+        if not isinstance(other, MoESuperWeight):
+            return False
+        return self.moe_weight_key == other.moe_weight_key
     
     def __str__(self) -> str:
         base_str = super().__str__()
