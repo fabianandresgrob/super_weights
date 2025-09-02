@@ -133,10 +133,40 @@ def get_random_wikitext_prompt(session, seed: int = None) -> str:
             torch.set_rng_state(torch_seed_state)
 
 
-def detect_super_weights(session, logger: logging.Logger, spike_threshold: float = 50.0, 
+def get_model_specific_spike_threshold(model_name: str, user_threshold: Optional[float] = None) -> float:
+    """Get model-specific spike threshold based on model architecture"""
+    
+    # If user provided a threshold, use it
+    if user_threshold is not None:
+        return user_threshold
+    
+    # Model-specific thresholds based on architecture
+    model_thresholds = {
+        'llama': 120.0,
+        'phi': 250.0,
+        'olmo': 70.0,
+        'mistral': 100.0
+    }
+    
+    # Default threshold
+    default_threshold = 50.0
+    
+    # Parse model name to determine architecture
+    model_lower = model_name.lower()
+    
+    for arch_name, threshold in model_thresholds.items():
+        if arch_name in model_lower:
+            return threshold
+    
+    # Return default if no match found
+    return default_threshold
+
+
+def detect_super_weights(session, logger: logging.Logger, model_name: str, spike_threshold: float = 50.0, 
                         max_iterations: int = 10, detection_prompt: str = None) -> List:
     """Detect super weights in the model."""
     logger.info("Starting super weight detection...")
+    logger.info(f"Using spike threshold: {spike_threshold}")
     
     # Use provided prompt or get a random one
     if detection_prompt is None:
@@ -530,7 +560,7 @@ def process_model(model_name: str, output_dir: Path, logger: logging.Logger, arg
             'name': model_name,
             'timestamp': datetime.now().isoformat(),
             'config': {
-                'spike_threshold': args.spike_threshold,
+                'spike_threshold_user_input': args.spike_threshold,  # Store user input
                 'detection_max_iterations': args.detection_max_iterations,
                 'attack_num_steps': args.attack_num_steps,
                 'head_reduction': args.head_reduction,
@@ -567,9 +597,25 @@ def process_model(model_name: str, output_dir: Path, logger: logging.Logger, arg
     
     # Detect super weights
     try:
+        # Get model-specific spike threshold
+        model_specific_threshold = get_model_specific_spike_threshold(
+            model_name, 
+            args.spike_threshold
+        )
+        
+        # Update results with actual threshold used
+        results['model_info']['config']['spike_threshold'] = model_specific_threshold
+        results['model_info']['config']['spike_threshold_source'] = 'user' if args.spike_threshold is not None else 'model_specific'
+        
+        # Log the threshold being used
+        if args.spike_threshold is not None:
+            logger.info(f"Using user-specified spike threshold: {model_specific_threshold}")
+        else:
+            logger.info(f"Using model-specific spike threshold for {model_name}: {model_specific_threshold}")
+        
         super_weights = detect_super_weights(
-            session, logger, 
-            spike_threshold=args.spike_threshold,
+            session, logger, model_name,
+            spike_threshold=model_specific_threshold,
             max_iterations=args.detection_max_iterations,
             detection_prompt=args.detection_prompt
         )
@@ -715,8 +761,9 @@ def main():
                        help='Directory to cache downloaded models')
     
     # Super weight detection
-    parser.add_argument('--spike_threshold', type=float, default=50.0,
-                       help='Threshold for super weight detection')
+    parser.add_argument('--spike_threshold', type=float, default=None,
+                       help='Threshold for super weight detection. If not provided, uses model-specific defaults: '
+                            'Llama models (120), Phi models (250), OLMo models (70), Mistral models (100), Others (50)')
     parser.add_argument('--detection_max_iterations', type=int, default=10,
                        help='Maximum iterations for super weight detection')
     parser.add_argument('--detection_prompt', type=str, default=None,
@@ -802,7 +849,10 @@ def main():
     print(f"Models: {args.models}")
     print(f"Hypotheses: {args.hypotheses}")
     print(f"Output directory: {output_dir}")
-    print(f"Detection threshold: {args.spike_threshold}")
+    if args.spike_threshold is not None:
+        print(f"Detection threshold: {args.spike_threshold} (user-specified)")
+    else:
+        print(f"Detection threshold: model-specific (Llama=120, Phi=250, OLMo=70, Mistral=100, Others=50)")
     print(f"Attack steps: {args.attack_num_steps}")
     print(f"Head reduction: {args.head_reduction}")
     print(f"Skip consistency: {args.skip_consistency}")

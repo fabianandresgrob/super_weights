@@ -139,6 +139,34 @@ class VocabularyAnalysisRunner:
         """Sanitize model name for filesystem use"""
         return model_name.replace('/', '-').replace('\\', '-')
     
+    def _get_model_specific_spike_threshold(self, model_name: str, user_threshold: Optional[float] = None) -> float:
+        """Get model-specific spike threshold based on model architecture"""
+        
+        # If user provided a threshold, use it
+        if user_threshold is not None:
+            return user_threshold
+        
+        # Model-specific thresholds based on architecture
+        model_thresholds = {
+            'llama': 120.0,
+            'phi': 150.0,
+            'olmo': 70.0,
+            'mistral': 100.0
+        }
+        
+        # Default threshold
+        default_threshold = 50.0
+        
+        # Parse model name to determine architecture
+        model_lower = model_name.lower()
+        
+        for arch_name, threshold in model_thresholds.items():
+            if arch_name in model_lower:
+                return threshold
+        
+        # Return default if no match found
+        return default_threshold
+    
     def run_analysis(self, 
                     model_names: List[str],
                     dataset: str,
@@ -150,7 +178,8 @@ class VocabularyAnalysisRunner:
                     enable_cascade: bool,
                     enable_enrichment: bool,
                     bootstrap: int,
-                    detection_config: Dict[str, Any]) -> Dict[str, Any]:
+                    detection_config: Dict[str, Any],
+                    cache_dir: str = '~/models/') -> Dict[str, Any]:
         """
         Run vocabulary analysis on multiple models
         
@@ -166,6 +195,7 @@ class VocabularyAnalysisRunner:
             enable_enrichment: Whether to enable token class enrichment
             bootstrap: Number of bootstrap samples (0 to disable)
             detection_config: Configuration for super weight detection
+            cache_dir: Directory to cache downloaded models
             
         Returns:
             Dictionary with analysis results for all models
@@ -215,7 +245,8 @@ class VocabularyAnalysisRunner:
                     enable_cascade=enable_cascade,
                     enable_enrichment=enable_enrichment,
                     bootstrap=bootstrap,
-                    detection_config=detection_config
+                    detection_config=detection_config,
+                    cache_dir=cache_dir
                 )
                 
                 all_results['model_results'][model_name] = model_results
@@ -251,7 +282,8 @@ class VocabularyAnalysisRunner:
                             enable_cascade: bool,
                             enable_enrichment: bool,
                             bootstrap: int,
-                            detection_config: Dict[str, Any]) -> Dict[str, Any]:
+                            detection_config: Dict[str, Any],
+                            cache_dir: str = '~/models/') -> Dict[str, Any]:
         """Analyze a single model"""
         
         # Setup model-specific directories
@@ -264,12 +296,29 @@ class VocabularyAnalysisRunner:
         self.logger.info(f"Loading model: {model_name}")
         with SuperWeightResearchSession.from_model_name(
             model_name, 
+            cache_dir=cache_dir,
             log_level=self.log_level
         ) as session:
             
+            # Create model-specific detection configuration
+            model_detection_config = detection_config.copy()
+            
+            # Set model-specific spike threshold
+            model_specific_threshold = self._get_model_specific_spike_threshold(
+                model_name, 
+                detection_config.get('spike_threshold')
+            )
+            model_detection_config['spike_threshold'] = model_specific_threshold
+            
+            # Log the threshold being used
+            if detection_config.get('spike_threshold') is not None:
+                self.logger.info(f"Using user-specified spike threshold: {model_specific_threshold}")
+            else:
+                self.logger.info(f"Using model-specific spike threshold for {model_name}: {model_specific_threshold}")
+            
             # Detect super weights
             self.logger.info("Detecting super weights...")
-            super_weights = session.detect_super_weights(**detection_config)
+            super_weights = session.detect_super_weights(**model_detection_config)
             
             self.logger.info(f"Detected {len(super_weights)} super weights")
             
@@ -338,7 +387,7 @@ class VocabularyAnalysisRunner:
                 'super_weights': [self._serialize_super_weight(sw) for sw in super_weights],
                 'neuron_analyses': neuron_analyses,
                 'super_weight_analyses': super_weight_analyses,
-                'detection_config': detection_config,
+                'detection_config': model_detection_config,
                 'analysis_summary': {
                     'total_super_weights': len(super_weights),
                     'successful_neuron_analyses': len(neuron_analyses),
@@ -1324,6 +1373,12 @@ def parse_arguments():
     )
     
     parser.add_argument(
+        '--cache-dir',
+        default='~/models/',
+        help='Directory to cache downloaded models'
+    )
+    
+    parser.add_argument(
         '--seed',
         type=int,
         default=42,
@@ -1360,8 +1415,9 @@ def parse_arguments():
     parser.add_argument(
         '--spike-threshold',
         type=float,
-        default=50.0,
-        help='Spike threshold for super weight detection'
+        default=None,
+        help='Spike threshold for super weight detection. If not provided, uses model-specific defaults: '
+             'Llama models (120), Phi models (150), OLMo models (70), Mistral models (100), Others (50)'
     )
     
     parser.add_argument(
@@ -1451,7 +1507,8 @@ def main():
             enable_cascade=args.enable_cascade,
             enable_enrichment=args.enable_enrichment,
             bootstrap=args.bootstrap,
-            detection_config=detection_config
+            detection_config=detection_config,
+            cache_dir=args.cache_dir
         )
         
         print(f"\nAnalysis completed successfully!")

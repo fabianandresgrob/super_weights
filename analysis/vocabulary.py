@@ -3,6 +3,7 @@ import torch.nn as nn
 import numpy as np
 import scipy.stats
 from typing import List, Dict, Any, Optional
+import traceback
 
 from detection.super_weight import SuperWeight
 from utils.model_architectures import UniversalMLPHandler
@@ -255,6 +256,8 @@ class VocabularyAnalyzer:
             }
             
         except Exception as e:
+            # log the traceback of the exception
+            self.logger.error(traceback.format_exc())
             return {
                 'super_weight': super_weight,
                 'error': f"Failed to analyze sw_neuron: {str(e)}"
@@ -385,6 +388,8 @@ class VocabularyAnalyzer:
             }
             
         except Exception as e:
+            # log the traceback of the exception
+            self.logger.error(traceback.format_exc())
             return {
                 'super_weight': super_weight,
                 'error': f"Cascade analysis failed: {str(e)}"
@@ -535,9 +540,12 @@ class VocabularyAnalyzer:
         
         Uses F.cosine_similarity for cleaner implementation and better numerical stability.
         """
+        # Ensure both tensors are on the same device (use unembedding matrix's device)
+        sw_neuron_device_matched = sw_neuron.to(unembedding_matrix.device)
+        
         # Use functional cosine similarity for cleaner, more robust computation
         cosine_similarities = torch.nn.functional.cosine_similarity(
-            unembedding_matrix, sw_neuron.unsqueeze(0), dim=1
+            unembedding_matrix, sw_neuron_device_matched.unsqueeze(0), dim=1
         )
         return cosine_similarities.cpu()
     
