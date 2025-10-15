@@ -351,7 +351,7 @@ print(f"Attack success: {attack_results['final_adv_string']}")
 
 This framework implements and extends methods from:
 - **Yu et al. (2025)**: [The Super Weight in Large Language Models](https://arxiv.org/abs/2411.07191) - Original super weight detection methodology
-- **Bills et al. (2023)**: [Language models can explain neurons in language models](https://arxiv.org/abs/2401.12181) - Universal Neurons framework for neuron analysis
+- **Gurnee et al. (2024)**: [Universal Neurons in GPT2 Language Models](https://arxiv.org/abs/2401.12181) - Universal Neurons framework for neuron analysis
 
 ## 🔬 Research Applications
 
