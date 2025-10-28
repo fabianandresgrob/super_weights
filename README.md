@@ -10,7 +10,7 @@ Super weights are individual parameters in transformer models that:
 - **Are sparsely distributed** across layers and components
 - **Challenge the "no privileged basis" assumption** in transformers
 
-This framework implements detection methods from [Yu et al. (2025)](https://arxiv.org/abs/2411.07191) and provides comprehensive analysis tools for understanding these critical parameters. Vocabulary analysis components build upon the Universal Neurons framework from [Bills et al. (2023)](https://arxiv.org/abs/2401.12181).
+This framework implements detection methods from [Yu et al. (2025)](https://arxiv.org/abs/2411.07191) and provides comprehensive analysis tools for understanding these critical parameters. Vocabulary analysis components build upon the Universal Neurons framework from [Gurnee et al. (2023)](https://arxiv.org/abs/2401.12181).
 
 ## 🚀 Quick Start
 
